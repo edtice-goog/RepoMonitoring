@@ -96,6 +96,67 @@ Talking points baked into the data:
 The monitor keeps state in memory only. Stop it (Ctrl+C in terminal 2) and
 start it again — the event feed is empty and the demo is ready to replay.
 
+## Live mode (optional) — real Black Duck + Claude + GitHub data
+
+Everything above is the **self-contained, offline demo** (Stage 1): fictitious
+ACME GW-7100 data, no network, no keys. That path is unchanged and always
+available. Two further stages layer *real* data on top of the same monitor and
+driver — useful for building an audience's suspension of disbelief
+progressively:
+
+| Stage | Watch manifest | Commit events | Compiled-file index |
+|---|---|---|---|
+| **1 — sample** (default) | hand-crafted `samples/` | hand-crafted `samples/` | hand-crafted `samples/` |
+| **2 — live provisioned** | **live Black Duck BOM**, VCS URLs **resolved by Claude** | **real upstream commits from GitHub** (cached) | real source tree at the release tag (approximated) |
+| **3 — genuinely captured** *(future)* | live Black Duck BOM | real commits | **real BD/CPP Coverity capture** of a build we ran ourselves |
+
+Stage 2 is what the `scripts/` helpers produce. Stage 3 needs a project we can
+actually build under BD/CPP (see `../configure-blackduck-compilers` skills);
+WinSCP can't be built without the Embarcadero C++Builder toolchain, so its
+compiled-file index in Stage 2 is *approximated* by the component's released
+source tree (honest stand-in, flagged `gh_tree_approx`).
+
+### Prerequisites for live mode
+
+1. `pip install -r requirements-live.txt` (adds the `anthropic` SDK; the offline
+   demo needs nothing).
+2. Copy `blackduck.local.example.json` to `blackduck.local.json` (gitignored)
+   and fill in `url`, `api_token` (Black Duck access token), `anthropic_api_key`,
+   and the `project` / `version` to provision.
+3. A GitHub login for the commit pull: `gh auth login` (or set `GITHUB_TOKEN`).
+
+### Building the live artifacts (one time — writes to `live/`, gitignored)
+
+```
+python scripts/bd_scout.py                 # optional: find a project with a 3-7 component BOM
+python scripts/bd_provision.py             # live BD BOM + Claude VCS enhancement -> live/hub-api-components.json
+python scripts/gh_replay.py --commits 8    # real commits + file index    -> live/winscp-commit-events.json, live/build-capture.json
+```
+
+The commit/index data for an old release tag is effectively static, so fetch it
+**once** and replay the saved files thereafter — no repeated GitHub calls.
+
+### Running the live demo (same three terminals, `--data-dir live`)
+
+```
+python triage-service/server.py
+python monitor/app.py --data-dir live
+python driver/replay.py --events live/winscp-commit-events.json --all
+```
+
+The dashboard now shows the live watch manifest (real repos, `sca:kb_vcs_url` +
+`capture:gh_tree` provenance, real pinned refs) and real upstream commits sorted
+into in-scope (triaged) vs suppressed. **Note:** with the *stub* triage service,
+every matched real commit routes to `needs_human_review` — the stub only knows
+the four canned sample hashes and fails safe on the rest. Real per-commit
+verdicts arrive with live `ClaudeTriage` (a separate step).
+
+## Resetting between runs (live mode)
+
+Same as above — the monitor holds no disk state. To re-fetch live data (e.g.
+after a new Black Duck scan), re-run the `scripts/` steps; the `live/` directory
+is overwritten and is gitignored so instance-specific data never gets committed.
+
 ## Troubleshooting
 
 - **"Address already in use"** — another process holds port 8377 or 8378. Use

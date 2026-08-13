@@ -1,0 +1,9 @@
+{
+  "_comment": "Copy this file to blackduck.local.json (gitignored) and fill in your test-instance details. Used by the live HubAPISBOMSource adapter and the scout/discovery helper. The API token is a Black Duck 'Access Token' created under your user profile; the adapter exchanges it for a short-lived bearer token via POST /api/tokens/authenticate.",
+  "url": "https://your-instance.blackduck.example",
+  "api_token": "PASTE_YOUR_BLACK_DUCK_ACCESS_TOKEN_HERE",
+  "anthropic_api_key": "PASTE_YOUR_ANTHROPIC_API_KEY_HERE",
+  "project": "",
+  "version": "",
+  "insecure_tls": false
+}

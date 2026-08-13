@@ -270,9 +270,18 @@ The vision deck lives in `slides/` (`gen_slides.py` regenerates
 
 ## Deliberately deferred (interfaces already in place)
 
+> Live prototypes for the first two now exist under `scripts/` (see
+> `DEMO.md` → *Live mode*): `bd_provision.py` pulls a real Black Duck BOM and
+> resolves VCS URLs via a Claude call; `gh_replay.py` fetches real upstream
+> commits and a source-file index. Both write cached artifacts the existing
+> monitor/driver replay unchanged.
+
 - Black Duck Hub API adapter (`SBOMSource`) — SBOM freshness at scale.
+  *(Live prototype: `scripts/bd_provision.py`.)*
 - Real git polling / webhook `ChangeSource`.
+  *(Live prototype: `scripts/gh_replay.py` — fetch-and-cache, replayed offline.)*
 - `ClaudeTriage` (`TriageEngine`) — live LLM triage replacing the truth-table stub.
+  *(Next up — reuses the `client.messages.parse` pattern from `bd_provision.py`.)*
 - Hunk-level version-applicability analysis at pinned `SRCREV`.
 - Rules pre-filter ahead of the LLM (cost lever if volume grows).
 - "Installed but not compiled" surface (scripts, configs, certs) via image

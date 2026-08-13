@@ -1,0 +1,10 @@
+# Optional dependencies for the LIVE demo features only.
+# The core deterministic demo (monitor/, triage-service/, driver/) needs NONE
+# of these — it runs on the Python standard library alone.
+#
+#   pip install -r requirements-live.txt
+#
+# Used by scripts/bd_provision.py (live Black Duck BOM pull + Claude VCS
+# enhancement). The Black Duck REST calls use urllib (stdlib); only the Claude
+# enhancement needs the Anthropic SDK.
+anthropic>=0.40
