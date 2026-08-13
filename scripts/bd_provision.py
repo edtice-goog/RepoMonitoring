@@ -36,7 +36,10 @@ from bd_scout import BDClient, load_config, meta_href, BOM_MEDIA  # noqa: E402
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 LIVE_DIR = REPO_ROOT / "live"
-MODEL = "claude-opus-5"
+# Demo default is a fast, economical model — there is no value in paying for a
+# frontier model to resolve repos for illustrative sample data. A real product
+# deployment would pass --model claude-opus-5 (or newer).
+MODEL = "claude-opus-4-6"
 
 SYSTEM_PROMPT = """\
 You enhance a software Bill of Materials (SBOM) with upstream source-repository \
@@ -179,6 +182,7 @@ def to_watch_manifest(project, version, comps, resolved) -> dict:
 
 
 def main() -> None:
+    global MODEL
     for stream in (sys.stdout, sys.stderr):
         try:
             stream.reconfigure(encoding="utf-8")
@@ -189,8 +193,10 @@ def main() -> None:
     ap.add_argument("--project", help="override project name from config")
     ap.add_argument("--version", help="override version name from config")
     ap.add_argument("--dry-run", action="store_true", help="fetch the BOM but skip the Claude call")
+    ap.add_argument("--model", default=MODEL, help="Claude model (default: fast/economical demo model)")
     ap.add_argument("--out", type=Path, default=LIVE_DIR / "hub-api-components.json")
     args = ap.parse_args()
+    MODEL = args.model
 
     cfg = load_config()
     project = args.project or cfg.get("project")

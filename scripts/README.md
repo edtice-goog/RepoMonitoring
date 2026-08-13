@@ -10,7 +10,7 @@ Install the one extra dependency first: `pip install -r ../requirements-live.txt
 | Script | What it does | Reads | Writes | Network |
 |---|---|---|---|---|
 | `bd_scout.py` | Explore the Black Duck instance to find a good demo target (a project version with a 3–7 component BOM). | `blackduck.local.json` | — (prints) | Black Duck |
-| `bd_provision.py` | Pull the live BOM for the configured `project`/`version`; resolve each component's upstream VCS URL with a Claude API call (`client.messages.parse`, `claude-opus-5`). | `blackduck.local.json` | `live/hub-api-components.json` | Black Duck + Claude |
+| `bd_provision.py` | Pull the live BOM for the configured `project`/`version`; resolve each component's upstream VCS URL with a Claude API call (`client.messages.parse`). | `blackduck.local.json` | `live/hub-api-components.json` | Black Duck + Claude |
 | `gh_replay.py` | For each resolved GitHub repo, fetch the most recent commits on its maintenance branch and a source-file index at the release tag; save both in the shapes the monitor/driver consume. | `live/hub-api-components.json` | `live/winscp-commit-events.json`, `live/build-capture.json` | GitHub (`gh auth token`) |
 
 ## Notes
@@ -29,3 +29,8 @@ Install the one extra dependency first: `pip install -r ../requirements-live.txt
   branch, not `master` — fixes land on the stable branch for an EOL release line.
 - **Idempotent + polite:** commit history for an old release tag is static, so
   fetch once and replay `live/*.json` offline instead of re-hitting GitHub.
+- **Model default is economical** (`claude-opus-4-6`) for both `bd_provision.py`
+  and the live triage service — there's no value paying frontier-model rates to
+  triage illustrative demo commits. Override with `--model claude-opus-5` for a
+  production-quality run. Changing the triage model invalidates prior verdicts,
+  so clear `live/triage-cache/` when you switch.

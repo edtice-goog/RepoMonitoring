@@ -281,7 +281,9 @@ The vision deck lives in `slides/` (`gen_slides.py` regenerates
 - Real git polling / webhook `ChangeSource`.
   *(Live prototype: `scripts/gh_replay.py` — fetch-and-cache, replayed offline.)*
 - `ClaudeTriage` (`TriageEngine`) — live LLM triage replacing the truth-table stub.
-  *(Next up — reuses the `client.messages.parse` pattern from `bd_provision.py`.)*
+  *(Live prototype: `triage-service/claude_server.py` — a drop-in for the stub on
+  the same `/triage` contract; calls Claude, caches input→output for repeatable,
+  token-free replays.)*
 - Hunk-level version-applicability analysis at pinned `SRCREV`.
 - Rules pre-filter ahead of the LLM (cost lever if volume grows).
 - "Installed but not compiled" surface (scripts, configs, certs) via image

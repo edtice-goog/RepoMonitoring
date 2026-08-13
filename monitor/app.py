@@ -164,7 +164,10 @@ class MonitorState:
             method="POST",
         )
         try:
-            with urllib.request.urlopen(req, timeout=10) as resp:
+            # The stub answers in milliseconds; a live LLM triage backend
+            # (claude_server.py) can take much longer on a first, uncached
+            # commit, so allow generous headroom. Cached repeats are instant.
+            with urllib.request.urlopen(req, timeout=180) as resp:
                 return json.loads(resp.read()), None
         except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as exc:
             return None, f"triage service unreachable: {exc}"

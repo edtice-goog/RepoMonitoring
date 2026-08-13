@@ -146,10 +146,25 @@ python driver/replay.py --events live/winscp-commit-events.json --all
 
 The dashboard now shows the live watch manifest (real repos, `sca:kb_vcs_url` +
 `capture:gh_tree` provenance, real pinned refs) and real upstream commits sorted
-into in-scope (triaged) vs suppressed. **Note:** with the *stub* triage service,
-every matched real commit routes to `needs_human_review` — the stub only knows
-the four canned sample hashes and fails safe on the rest. Real per-commit
-verdicts arrive with live `ClaudeTriage` (a separate step).
+into in-scope (triaged) vs suppressed.
+
+**Triage backend — stub vs live Claude.** With the *stub* `server.py`, every
+matched real commit routes to `needs_human_review` (it only knows the four canned
+sample hashes and fails safe on the rest). To get **real per-commit verdicts**,
+run the live triage service instead of the stub in terminal 1:
+
+```
+python triage-service/claude_server.py     # calls Claude; same port/contract as the stub
+```
+
+It fetches each commit's message + diff from GitHub, asks Claude for a structured
+verdict, and **caches input→output under `live/triage-cache/`**. The first pass is
+slow (one model call per matched commit); every repeat of the same request is an
+instant cache hit with no token spend — so re-running the demo, or two users
+issuing the same request, share one answer. Default model is the economical
+`claude-opus-4-6`; pass `--model claude-opus-5` for production-grade verdicts
+(clear `live/triage-cache/` when changing models). `--cache-only` serves purely
+from cache (offline, no keys) and fails safe on a miss.
 
 ## Resetting between runs (live mode)
 
