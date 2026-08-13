@@ -1,0 +1,11 @@
+# Build output — regenerate with `python package.py`
+dist/
+
+# Scratch PDF text extraction (copyrighted paper content, mostly binary junk)
+_extracted.txt
+
+# Local machine-specific Claude settings
+.claude/settings.local.json
+
+__pycache__/
+*.pyc

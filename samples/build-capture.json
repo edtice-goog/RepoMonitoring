@@ -1,0 +1,72 @@
+{
+  "tool": "blackduck-c-cpp (simulated output for demo)",
+  "project": "acme-gw7100-firmware",
+  "build_id": "gw7100-2026.06-rc2",
+  "captured_at": "2026-06-10T14:22:31Z",
+  "build_root": "/build/gw7100/tmp/work",
+  "_comment": "The capture phase emits (1) every compiled file, (2) components it can resolve locally via the system package manager, and (3) every VCS URL discoverable on the build host at capture time — .git remotes and build-system metadata. Local forks and upstream remotes may both appear; de-duplicating/reconciling VCS URLs is the SCA side's job, not the capture phase's.",
+
+  "files": [
+    { "path": "/build/gw7100/tmp/work/linux-acme/6.6.30/source/net/core/dev.c",                    "kind": "source", "component": "linux-kernel", "component_version": "6.6.30", "resolution": "sca_match" },
+    { "path": "/build/gw7100/tmp/work/linux-acme/6.6.30/source/net/core/skbuff.c",                 "kind": "source", "component": "linux-kernel", "component_version": "6.6.30", "resolution": "sca_match" },
+    { "path": "/build/gw7100/tmp/work/linux-acme/6.6.30/source/net/ipv4/tcp_input.c",              "kind": "source", "component": "linux-kernel", "component_version": "6.6.30", "resolution": "sca_match" },
+    { "path": "/build/gw7100/tmp/work/linux-acme/6.6.30/source/net/ipv4/ip_output.c",              "kind": "source", "component": "linux-kernel", "component_version": "6.6.30", "resolution": "sca_match" },
+    { "path": "/build/gw7100/tmp/work/linux-acme/6.6.30/source/drivers/net/phy/phy_device.c",      "kind": "source", "component": "linux-kernel", "component_version": "6.6.30", "resolution": "sca_match" },
+    { "path": "/build/gw7100/tmp/work/linux-acme/6.6.30/source/drivers/tty/serial/serial_core.c",  "kind": "source", "component": "linux-kernel", "component_version": "6.6.30", "resolution": "sca_match" },
+    { "path": "/build/gw7100/tmp/work/linux-acme/6.6.30/source/drivers/mmc/core/block.c",          "kind": "source", "component": "linux-kernel", "component_version": "6.6.30", "resolution": "sca_match" },
+    { "path": "/build/gw7100/tmp/work/linux-acme/6.6.30/source/drivers/i2c/i2c-core-base.c",       "kind": "source", "component": "linux-kernel", "component_version": "6.6.30", "resolution": "sca_match" },
+    { "path": "/build/gw7100/tmp/work/linux-acme/6.6.30/source/drivers/gpio/gpiolib.c",            "kind": "source", "component": "linux-kernel", "component_version": "6.6.30", "resolution": "sca_match" },
+    { "path": "/build/gw7100/tmp/work/linux-acme/6.6.30/source/fs/ext4/inode.c",                   "kind": "source", "component": "linux-kernel", "component_version": "6.6.30", "resolution": "sca_match" },
+    { "path": "/build/gw7100/tmp/work/linux-acme/6.6.30/source/kernel/time/timer.c",               "kind": "source", "component": "linux-kernel", "component_version": "6.6.30", "resolution": "sca_match" },
+    { "path": "/build/gw7100/tmp/work/linux-acme/6.6.30/source/include/linux/skbuff.h",            "kind": "header", "component": "linux-kernel", "component_version": "6.6.30", "resolution": "sca_match" },
+    { "path": "/build/gw7100/tmp/work/linux-acme/6.6.30/source/include/linux/netdevice.h",         "kind": "header", "component": "linux-kernel", "component_version": "6.6.30", "resolution": "sca_match" },
+    { "path": "/build/gw7100/tmp/work/linux-acme/6.6.30/source/include/net/sock.h",                "kind": "header", "component": "linux-kernel", "component_version": "6.6.30", "resolution": "sca_match" },
+
+    { "path": "/build/gw7100/tmp/work/busybox/1.36.1/source/networking/udhcp/dhcpc.c",             "kind": "source", "component": "busybox", "component_version": "1.36.1", "resolution": "sca_match" },
+    { "path": "/build/gw7100/tmp/work/busybox/1.36.1/source/networking/udhcp/packet.c",            "kind": "source", "component": "busybox", "component_version": "1.36.1", "resolution": "sca_match" },
+    { "path": "/build/gw7100/tmp/work/busybox/1.36.1/source/networking/ifupdown.c",                "kind": "source", "component": "busybox", "component_version": "1.36.1", "resolution": "sca_match" },
+    { "path": "/build/gw7100/tmp/work/busybox/1.36.1/source/libbb/safe_strncpy.c",                 "kind": "source", "component": "busybox", "component_version": "1.36.1", "resolution": "sca_match" },
+    { "path": "/build/gw7100/tmp/work/busybox/1.36.1/source/include/libbb.h",                      "kind": "header", "component": "busybox", "component_version": "1.36.1", "resolution": "sca_match" },
+
+    { "path": "/build/gw7100/tmp/work/zlib/1.3.1/source/inflate.c",                                "kind": "source", "component": "zlib", "component_version": "1.3.1", "resolution": "sca_match" },
+    { "path": "/build/gw7100/tmp/work/zlib/1.3.1/source/inftrees.c",                               "kind": "source", "component": "zlib", "component_version": "1.3.1", "resolution": "sca_match" },
+    { "path": "/build/gw7100/tmp/work/zlib/1.3.1/source/zutil.c",                                  "kind": "source", "component": "zlib", "component_version": "1.3.1", "resolution": "sca_match" },
+    { "path": "/build/gw7100/tmp/work/zlib/1.3.1/source/inflate.h",                                "kind": "header", "component": "zlib", "component_version": "1.3.1", "resolution": "sca_match" },
+    { "path": "/build/gw7100/tmp/work/zlib/1.3.1/source/zlib.h",                                   "kind": "header", "component": "zlib", "component_version": "1.3.1", "resolution": "sca_match" },
+
+    { "path": "/usr/include/openssl/ssl.h",                                                        "kind": "header", "component": "openssl", "component_version": "3.0.13", "resolution": "package_manager", "package": "libssl-dev 3.0.13-1 (dpkg)" },
+    { "path": "/usr/include/openssl/evp.h",                                                        "kind": "header", "component": "openssl", "component_version": "3.0.13", "resolution": "package_manager", "package": "libssl-dev 3.0.13-1 (dpkg)" },
+    { "path": "/usr/lib/x86_64-linux-gnu/libssl.so.3",                                             "kind": "object", "component": "openssl", "component_version": "3.0.13", "resolution": "package_manager", "package": "libssl3 3.0.13-1 (dpkg)" }
+  ],
+
+  "repos_detected": [
+    {
+      "local_path": "/build/gw7100/tmp/work/linux-acme/6.6.30/source",
+      "associated_component": "linux-kernel",
+      "discovered_via": ["git_metadata", "build_metadata:SRC_URI"],
+      "pinned_ref": "v6.6.30-acme3 (commit 8c3f2a1d9e0b74c5a6f1e2d3c4b5a69788f0e1d2)",
+      "vcs_urls": [
+        { "url": "https://git.acme.example/firmware/linux-acme.git",                              "found_in": "git_remote:origin",   "relationship": "local_fork" },
+        { "url": "https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git",              "found_in": "git_remote:upstream", "relationship": "upstream" }
+      ]
+    },
+    {
+      "local_path": "/build/gw7100/tmp/work/busybox/1.36.1/source",
+      "associated_component": "busybox",
+      "discovered_via": ["git_metadata", "build_metadata:SRC_URI"],
+      "pinned_ref": "1_36_1 (commit d1f4b3a2c5e6978801f2e3d4c5b6a7980e1f2a3b)",
+      "vcs_urls": [
+        { "url": "https://git.busybox.net/busybox",                                               "found_in": "git_remote:origin",   "relationship": "upstream" }
+      ]
+    },
+    {
+      "local_path": "/build/gw7100/tmp/work/zlib/1.3.1/source",
+      "associated_component": "zlib",
+      "discovered_via": ["build_metadata:SRC_URI"],
+      "pinned_ref": null,
+      "vcs_urls": [],
+      "source_archive": "https://zlib.net/zlib-1.3.1.tar.gz",
+      "_note": "Tarball fetch — no .git on disk, no VCS in build metadata. Capture emits what it found; VCS resolution for this component falls to the SCA side."
+    }
+  ]
+}
