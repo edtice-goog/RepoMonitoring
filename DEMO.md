@@ -125,15 +125,18 @@ source, linking a prebuilt OpenSSL 3.6.3**:
   (`build_openssl.bat` — the linked "vendor" lib), and `build_capture.bat` which
   clean-builds curl + zlib. `capture.bat` runs `blackduck-c-cpp` over that build
   and pushes project `repo-mon-stage3-curl` to Black Duck.
-- `scripts/cov_index.py` turns the capture's `cov_emit_links.json`
-  (`cov-manage-emit list-capture-invocations`) into the real compiled-file index
-  → `live-stage3/build-capture.json`. curl (429 files) + zlib (31) are compiled;
-  **OpenSSL has 0 compiled files** → reference-only.
-- `bd_provision.py` (BOM+Claude VCS) and `gh_replay.py --events-only` fill in
-  `live-stage3/`. Run it:
+- `scripts/attribute_capture.py` builds the watch set **without assuming files
+  are tidily arranged by component** (if they were, you wouldn't need SCA). It
+  takes the union of the **Black Duck BoM** and a **Claude reconstruction from the
+  compiled file paths** (`cov_emit_links.json`), enumerates each candidate repo's
+  file tree, and attributes every compiled file to a repo via the mapping service
+  (`scripts/repo_mapper.py`, longest-suffix). A repo is **monitored iff it owns ≥1
+  *primary* translation unit** — OpenSSL, whose headers were `#included` but whose
+  `.c` were never compiled, owns none → reference-only. Build tools (CMake) are
+  excluded. Run it:
 
 ```
-python scripts/bd_provision.py --project repo-mon-stage3-curl --version 8.11.0 --out live-stage3/hub-api-components.json
+python scripts/attribute_capture.py     # BD BoM ∪ Claude-from-files → mapped index + union manifest
 python scripts/gh_replay.py --manifest live-stage3/hub-api-components.json --out-dir live-stage3 --events-name stage3-commit-events.json --events-only --commits 6
 python triage-service/claude_server.py
 python monitor/app.py --data-dir live-stage3
@@ -143,7 +146,16 @@ python driver/replay.py --events live-stage3/stage3-commit-events.json --all
 The dashboard shows the **precision funnel** (SBOM 3 → compiled 2 → monitored 2 ·
 reference-only 1), curl+zlib under *Monitored repos*, OpenSSL under *Referenced,
 not monitored*, and OpenSSL's commits marked `not_monitored` (short-circuited at
-the repo level — never relevance-filtered or triaged).
+the repo level — never relevance-filtered or triaged). A version Black Duck
+couldn't supply (a repo only Claude spotted) is shown with an `≈ inferred` flag.
+
+> **Known limitation (next up):** when a compiled file's path exists in more than
+> one candidate repo — a vendor **fork** and its **upstream**, or a repo that
+> **vendors a copy** of a dependency (CMake bundles curl+zlib, which is why it's
+> filtered) — longest-suffix can't tell them apart and breaks the tie
+> arbitrarily. This is the first objection an audience will raise; the
+> `Attribution.ambiguous` flag marks these, and proper disambiguation is the
+> planned follow-up in `repo_mapper.py`.
 
 ### Prerequisites for live mode
 

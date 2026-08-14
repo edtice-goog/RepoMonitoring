@@ -96,6 +96,12 @@ class MonitorState:
                     provenance="sca:kb_vcs_url",
                     pinned_ref=item.get("componentVersionName"),
                 )
+                # Record where the version came from so the UI can flag inferred
+                # values honestly: "bd" = authoritative SCA BoM; "claude-inferred"
+                # = a repo BD didn't identify, version proposed by Claude.
+                w = self.watch_by_url.get(norm_url(url))
+                if w is not None:
+                    w["version_source"] = item.get("versionSource", "bd")
 
         # Compiled-file index: strip each file's repo-local prefix so paths
         # are upstream-repo-relative, ready for suffix matching.
@@ -259,11 +265,18 @@ def render_dashboard(state: MonitorState) -> str:
     def esc(s):
         return str(s).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
+    def _pin(w):
+        ref = f"<code>{esc(w['pinned_ref'] or '—')}</code>"
+        if w.get("version_source") == "claude-inferred":
+            ref += (" <span class='muted' title='Version inferred by Claude — "
+                    "Black Duck did not identify this component'>≈ inferred</span>")
+        return ref
+
     def _rows(ws):
         return "".join(
             f"<tr><td>{esc(w['component'])}</td><td><code>{esc(w['url'])}</code></td>"
             f"<td>{esc(w['relationship'])}</td><td>{esc(', '.join(w['provenance']))}</td>"
-            f"<td><code>{esc(w['pinned_ref'] or '—')}</code></td></tr>"
+            f"<td>{_pin(w)}</td></tr>"
             for w in ws)
 
     mon = [w for w in state.watches if w.get("monitored", True)]
