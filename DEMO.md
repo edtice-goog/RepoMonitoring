@@ -108,13 +108,42 @@ progressively:
 |---|---|---|---|
 | **1 — sample** (default) | hand-crafted `samples/` | hand-crafted `samples/` | hand-crafted `samples/` |
 | **2 — live provisioned** | **live Black Duck BOM**, VCS URLs **resolved by Claude** | **real upstream commits from GitHub** (cached) | real source tree at the release tag (approximated) |
-| **3 — genuinely captured** *(future)* | live Black Duck BOM | real commits | **real BD/CPP Coverity capture** of a build we ran ourselves |
+| **3 — genuinely captured** | live Black Duck BOM | real commits | **real BD/CPP Coverity capture** of a build we ran ourselves |
 
-Stage 2 is what the `scripts/` helpers produce. Stage 3 needs a project we can
-actually build under BD/CPP (see `../configure-blackduck-compilers` skills);
-WinSCP can't be built without the Embarcadero C++Builder toolchain, so its
-compiled-file index in Stage 2 is *approximated* by the component's released
-source tree (honest stand-in, flagged `gh_tree_approx`).
+Stage 2 is what the `scripts/` helpers produce from a binary-scan BOM: its
+compiled-file index is *approximated* by each component's released source tree
+(honest stand-in, flagged `gh_tree_approx`), because WinSCP can't be built
+without the Embarcadero C++Builder toolchain.
+
+**Stage 3 is real.** We build a project ourselves under BD/CPP so the
+compiled-file index is authoritative — which is the only way to truthfully
+separate *monitored* (compiled from source) from *reference-only* (linked but
+not compiled). The reference build is **cURL 8.11 + zlib 1.3.1 compiled from
+source, linking a prebuilt OpenSSL 3.6.3**:
+
+- `stage3/` (outside the repo) holds the source, an OpenSSL-from-source build
+  (`build_openssl.bat` — the linked "vendor" lib), and `build_capture.bat` which
+  clean-builds curl + zlib. `capture.bat` runs `blackduck-c-cpp` over that build
+  and pushes project `repo-mon-stage3-curl` to Black Duck.
+- `scripts/cov_index.py` turns the capture's `cov_emit_links.json`
+  (`cov-manage-emit list-capture-invocations`) into the real compiled-file index
+  → `live-stage3/build-capture.json`. curl (429 files) + zlib (31) are compiled;
+  **OpenSSL has 0 compiled files** → reference-only.
+- `bd_provision.py` (BOM+Claude VCS) and `gh_replay.py --events-only` fill in
+  `live-stage3/`. Run it:
+
+```
+python scripts/bd_provision.py --project repo-mon-stage3-curl --version 8.11.0 --out live-stage3/hub-api-components.json
+python scripts/gh_replay.py --manifest live-stage3/hub-api-components.json --out-dir live-stage3 --events-name stage3-commit-events.json --events-only --commits 6
+python triage-service/claude_server.py
+python monitor/app.py --data-dir live-stage3
+python driver/replay.py --events live-stage3/stage3-commit-events.json --all
+```
+
+The dashboard shows the **precision funnel** (SBOM 3 → compiled 2 → monitored 2 ·
+reference-only 1), curl+zlib under *Monitored repos*, OpenSSL under *Referenced,
+not monitored*, and OpenSSL's commits marked `not_monitored` (short-circuited at
+the repo level — never relevance-filtered or triaged).
 
 ### Prerequisites for live mode
 

@@ -184,9 +184,14 @@ def main() -> None:
 
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--commits", type=int, default=10, help="recent commits per repo")
-    ap.add_argument("--events-only", action="store_true", help="skip the compiled-file index")
+    ap.add_argument("--events-only", action="store_true",
+                    help="skip the gh_tree compiled-file index (use with a real BD/CPP capture)")
     ap.add_argument("--manifest", type=Path, default=MANIFEST)
+    ap.add_argument("--out-dir", type=Path, default=LIVE_DIR, help="where to write the events/index")
+    ap.add_argument("--events-name", default="winscp-commit-events.json",
+                    help="filename for the saved events")
     args = ap.parse_args()
+    out_dir = args.out_dir
 
     if not args.manifest.exists():
         sys.exit(f"missing {args.manifest} - run scripts/bd_provision.py first")
@@ -229,20 +234,20 @@ def main() -> None:
             print(f"    ! GitHub HTTP {exc.code}: {exc.reason} - skipping", flush=True)
             continue
 
-    LIVE_DIR.mkdir(parents=True, exist_ok=True)
+    out_dir.mkdir(parents=True, exist_ok=True)
 
-    events_out = LIVE_DIR / "winscp-commit-events.json"
+    events_out = out_dir / args.events_name
     events_out.write_text(json.dumps({
-        "_comment": ("REAL upstream commits fetched from GitHub for the winscp.exe "
-                     "BOM, saved so the demo replays without hitting GitHub. Schema "
-                     "matches samples/commit-events.json; fire with driver/replay.py "
+        "_comment": (f"REAL upstream commits fetched from GitHub for {manifest.get('project','?')}, "
+                     "saved so the demo replays without hitting GitHub. Schema matches "
+                     "samples/commit-events.json; fire with driver/replay.py "
                      f"--events {events_out.name}."),
         "events": all_events,
     }, indent=2), encoding="utf-8")
     print(f"\n[write] {len(all_events)} events -> {events_out}", flush=True)
 
     if not args.events_only:
-        capture_out = LIVE_DIR / "build-capture.json"
+        capture_out = out_dir / "build-capture.json"
         capture_out.write_text(json.dumps({
             "_comment": ("Compiled-file index APPROXIMATED from each component's "
                          "released source tree on GitHub (kind=gh_tree_approx). A real "
@@ -256,7 +261,7 @@ def main() -> None:
         print(f"[write] {len(all_files)} indexed files -> {capture_out}", flush=True)
 
     print("\nNext:", flush=True)
-    print(f"  python monitor/app.py --data-dir {LIVE_DIR}", flush=True)
+    print(f"  python monitor/app.py --data-dir {out_dir}", flush=True)
     print(f"  python driver/replay.py --events {events_out} --all", flush=True)
 
 

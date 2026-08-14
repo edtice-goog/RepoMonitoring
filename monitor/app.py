@@ -110,6 +110,15 @@ class MonitorState:
             entry = {"rel": rel, "path": f["path"], "kind": f["kind"]}
             self.file_index.setdefault(comp, []).append(entry)
 
+        # Build-observed classification (determined once, here): a watched
+        # component is MONITORED iff its source was actually compiled — i.e. it
+        # has files in the compiled-file index. Components in the SBOM with no
+        # compiled files are reference-only (linked/prebuilt, e.g. an OpenSSL the
+        # build only links) — shown for transparency but not watched. This is the
+        # SBOM (recall) x compiled-set (precision) intersection at repo scope.
+        for w in self.watches:
+            w["monitored"] = len(self.file_index.get(w["component"], [])) > 0
+
     def _add_watch(self, url, component, relationship, provenance, pinned_ref):
         key = norm_url(url)
         existing = self.watch_by_url.get(key)
@@ -188,6 +197,26 @@ class MonitorState:
             self.results.insert(0, result)
             return {"status": "ignored", "reason": result["reason"]}
 
+        if not watch.get("monitored", True):
+            # Reference-only component: in the SBOM but never compiled from source
+            # in this build. Short-circuit at the repo level — no relevance filter,
+            # no triage — rather than suppressing each commit after the fact.
+            summaries = []
+            for commit in payload.get("commits", []):
+                sha = commit.get("id") or commit.get("sha") or "?"
+                changed = (commit.get("added") or []) + (commit.get("modified") or []) \
+                    + (commit.get("removed") or [])
+                self.results.insert(0, {
+                    "received_at": now_iso(), "repo": repo_url, "ref": ref,
+                    "component": watch["component"], "relationship": watch["relationship"],
+                    "commit": sha, "message": commit.get("message", ""),
+                    "files_changed": changed, "in_scope": [], "status": "not_monitored",
+                    "reason": "reference-only: linked into the build but not compiled "
+                              "from source; excluded from monitoring",
+                })
+                summaries.append({"commit": sha, "status": "not_monitored", "verdict": None})
+            return {"status": "not_monitored", "commits": summaries}
+
         summaries = []
         for commit in payload.get("commits", []):
             sha = commit.get("id") or commit.get("sha") or "?"
@@ -230,11 +259,29 @@ def render_dashboard(state: MonitorState) -> str:
     def esc(s):
         return str(s).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
-    watch_rows = "".join(
-        f"<tr><td>{esc(w['component'])}</td><td><code>{esc(w['url'])}</code></td>"
-        f"<td>{esc(w['relationship'])}</td><td>{esc(', '.join(w['provenance']))}</td>"
-        f"<td><code>{esc(w['pinned_ref'] or '—')}</code></td></tr>"
-        for w in state.watches)
+    def _rows(ws):
+        return "".join(
+            f"<tr><td>{esc(w['component'])}</td><td><code>{esc(w['url'])}</code></td>"
+            f"<td>{esc(w['relationship'])}</td><td>{esc(', '.join(w['provenance']))}</td>"
+            f"<td><code>{esc(w['pinned_ref'] or '—')}</code></td></tr>"
+            for w in ws)
+
+    mon = [w for w in state.watches if w.get("monitored", True)]
+    ref = [w for w in state.watches if not w.get("monitored", True)]
+    watch_rows = _rows(mon)
+    comps = {w["component"] for w in state.watches}
+    mon_comps = {w["component"] for w in mon}
+    funnel = (f"SBOM (Black Duck): {len(comps)} component(s) &rarr; "
+              f"compiled from source (BD/CPP): {len(mon_comps)} &rarr; "
+              f"<b>monitored: {len(mon_comps)}</b> · reference-only: {len(comps) - len(mon_comps)}")
+    ref_section = ""
+    if ref:
+        ref_section = (
+            f"<h2 style='color:#7F8C8D'>Referenced, not monitored ({len(ref)})</h2>"
+            f"<p class='muted'>In the SBOM but not compiled from source in this build "
+            f"(linked/prebuilt) — listed for transparency, excluded from monitoring.</p>"
+            f"<table><tr><th>Component</th><th>VCS URL</th><th>Relationship</th>"
+            f"<th>Provenance</th><th>Pinned ref</th></tr>{_rows(ref)}</table>")
 
     def result_card(r):
         status = r["status"]
@@ -242,7 +289,7 @@ def render_dashboard(state: MonitorState) -> str:
         color = {"response_required": "#C0392B", "needs_human_review": "#B9770E",
                  "not_meaningful": "#7F8C8D"}.get(verdict) or \
                 {"suppressed": "#2E7D32", "ignored": "#7F8C8D",
-                 "triage_error": "#C0392B"}.get(status, "#34495E")
+                 "not_monitored": "#5D6D7E", "triage_error": "#C0392B"}.get(status, "#34495E")
         label = verdict or status
         files = ", ".join(f"<code>{esc(m['path'])}</code> (tier {m['tier']})"
                           for m in r.get("in_scope", [])) or "—"
@@ -277,9 +324,11 @@ def render_dashboard(state: MonitorState) -> str:
 <h1>RepoMonitoring <span class="muted">— {esc(state.project)} ({esc(state.build_id)})</span></h1>
 <p class="muted">Demo monitoring component. Data loaded from disk; in production this is fed by the
 BD SCA notification API. Triage backend: <code>{esc(state.triage_url)}</code> (stub).</p>
-<h2>Watch manifest ({len(state.watches)} repos)</h2>
+<p class="muted" style="font-size:13px"><b>Precision funnel:</b> {funnel}</p>
+<h2>Monitored repos ({len(mon)})</h2>
 <table><tr><th>Component</th><th>VCS URL</th><th>Relationship</th><th>Provenance</th><th>Pinned ref</th></tr>
 {watch_rows}</table>
+{ref_section}
 <h2>Commit events ({len(state.results)})</h2>
 {cards}
 </body></html>"""

@@ -13,6 +13,7 @@ blackduck.local.json
 
 # Live provisioning output (instance-derived watch manifests) and local venvs.
 live/
+live-stage3/
 .venv/
 
 __pycache__/

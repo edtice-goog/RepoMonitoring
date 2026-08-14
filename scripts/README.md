@@ -11,7 +11,8 @@ Install the one extra dependency first: `pip install -r ../requirements-live.txt
 |---|---|---|---|---|
 | `bd_scout.py` | Explore the Black Duck instance to find a good demo target (a project version with a 3–7 component BOM). | `blackduck.local.json` | — (prints) | Black Duck |
 | `bd_provision.py` | Pull the live BOM for the configured `project`/`version`; resolve each component's upstream VCS URL with a Claude API call (`client.messages.parse`). | `blackduck.local.json` | `live/hub-api-components.json` | Black Duck + Claude |
-| `gh_replay.py` | For each resolved GitHub repo, fetch the most recent commits on its maintenance branch and a source-file index at the release tag; save both in the shapes the monitor/driver consume. | `live/hub-api-components.json` | `live/winscp-commit-events.json`, `live/build-capture.json` | GitHub (`gh auth token`) |
+| `gh_replay.py` | For each resolved GitHub repo, fetch the most recent commits on its maintenance branch and (unless `--events-only`) a source-file index at the release tag. `--out-dir`/`--events-name` target a specific data dir. | `<manifest>` | `<out-dir>/<events>`, `<out-dir>/build-capture.json` | GitHub (`gh auth token`) |
+| `cov_index.py` | **Stage 3 only.** Turn a real BD/CPP capture (`cov_emit_links.json`, from `cov-manage-emit list-capture-invocations`) into the authoritative compiled-file index — the components whose source was actually compiled. Linked-only components (e.g. OpenSSL) have zero files and become reference-only. | `bdcpp-output/cov_emit_links.json` | `live-stage3/build-capture.json` | none |
 
 ## Notes
 
