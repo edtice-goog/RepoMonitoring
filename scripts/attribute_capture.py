@@ -2,34 +2,38 @@
 
 Determines which repos to monitor from a genuine BD/CPP capture WITHOUT assuming
 files are tidily arranged by component (which, if true, would mean you didn't need
-SCA at all). The pipeline:
+SCA at all). Candidate repos come from the UNION of three independent signals so
+we never under-approximate:
 
-  1. Compiled files  <- cov_emit_links.json: the primary translation units (the
-     .c actually compiled) and the full compiled set (sources + included headers).
-  2. Black Duck BoM  <- the SCA-identified components (recall side; already
-     VCS-resolved by bd_provision into live-stage3/hub-api-components.json).
-  3. Claude-from-files BoM <- ask Claude to reconstruct the components purely from
-     the compiled file paths (a second, independent identification). Boosts recall
-     and proposes versions for anything BD missed.
-  4. Candidate repos = UNION of (2) and (3) -> a repo is only missed if BOTH miss
-     it.
-  5. Enumerate each candidate repo's file set at its tag (GitHub tree).
-  6. attribute() every compiled file to a repo via the mapping service
-     (scripts/repo_mapper.py; longest-suffix today).
-  7. A repo is MONITORED iff it owns >=1 PRIMARY translation unit. Owning only
-     #included headers (e.g. OpenSSL, which curl links prebuilt) is NOT compiled
-     from source: the fix there is to wait for the vendor's release binary, not to
-     patch-and-recompile -- out of our use case -> reference-only.
+  1. Black Duck BoM            - SCA content-identity (BDBA on the binary).
+  2. Claude-from-compiled-files - a second content-identity, from the file paths.
+  3. .git discovery            - the actual checkouts on disk. A compiled file
+     inside a checkout is DEFINITIVELY that repo's code (ground-truth attribution,
+     no longest-suffix guessing), and its remote tells us where it came from.
 
-Writes live-stage3/build-capture.json (compiled index for monitored repos) and
-rewrites live-stage3/hub-api-components.json as the union watch manifest, tagging
-each version with its source (bd | claude-inferred) so the UI can flag inferred
-values honestly.
+Key rule for vendored / forked copies: we MONITOR THE CANONICAL upstream, not the
+local copy. A vendored copy is inert (zero activity); security patches land in the
+project repo. So a discovered checkout (e.g. a fork edtice-goog/zlib) is resolved
+to its canonical (fork-parent madler/zlib), which is what gets watched, and the
+local copy is shown as divergent PROVENANCE - never a second monitored repo. If a
+discovered repo can't be tied to a content-identified canonical, we still list it
+(union: never miss); inert ones are harmless (their commits find nothing in scope).
+
+Monitored iff a repo owns >=1 PRIMARY translation unit (a .c actually compiled).
+Owning only #included headers (OpenSSL, linked prebuilt) is not compiled-from-
+source -> reference-only.
+
+Writes live-stage3/build-capture.json (compiled index, anchored on the canonical
+so upstream commits match) and a union hub-api-components.json tagging each
+version's source (bd | claude-inferred | git-discovered) and any divergent
+built-from provenance, so the UI can be honest about what it knows.
 """
 
 import argparse
 import json
+import os
 import re
+import subprocess
 import sys
 from pathlib import Path
 
@@ -61,19 +65,11 @@ automake, and compilers (MSVC, GCC, Clang, LLVM). Their presence in build paths 
 (e.g. CMakeFiles/, compiler probe files) does NOT make them shipped components. \
 List only libraries/software actually compiled or linked into the product."""
 
-# Belt-and-suspenders: build tools are never BoM components, so drop them even if
-# the model surfaces one anyway.
 BUILD_TOOLS = {"cmake", "ninja", "make", "gnu make", "meson", "autoconf",
                "automake", "gcc", "clang", "llvm", "msvc", "coverity"}
 
 
-# --------------------------------------------------------------- emit parsing
 def _is_scaffolding(path: str) -> bool:
-    """Build-system probe compilations, not part of the product. CMake's
-    compiler-detection compiles CMakeCCompilerId.c under CMakeFiles/*/CompilerId*/
-    on every configure; that is the build tool checking the compiler, never a
-    shipped component. Excluding it stops the build tool itself (CMake, etc.) from
-    being mistaken for a monitored dependency."""
     p = path.replace("\\", "/").lower()
     return "/cmakefiles/" in p or "/compilerid" in p
 
@@ -102,12 +98,16 @@ def digest_tails(paths, depth=5, cap=500):
     return sorted(tails)[:cap]
 
 
+def norm_repo(url):
+    return re.sub(r"^https?://", "", (url or "").strip().lower()).rstrip("/").removesuffix(".git")
+
+
+def slugify(name):
+    return name.lower().replace(" ", "-")
+
+
 # --------------------------------------------------------------- Claude-from-files
 def claude_from_files(cfg, tails):
-    try:
-        import anthropic
-    except ImportError:
-        sys.exit("needs the anthropic SDK: pip install -r requirements-live.txt")
     from pydantic import BaseModel
     from typing import List, Literal, Optional
 
@@ -121,7 +121,7 @@ def claude_from_files(cfg, tails):
     class Result(BaseModel):
         components: List[Comp]
 
-    client = anthropic.Anthropic(api_key=cfg["anthropic_api_key"])
+    client = build_anthropic_client(cfg["anthropic_api_key"])
     resp = client.messages.parse(
         model=MODEL, max_tokens=4000, system=SYSTEM_FROMFILES,
         messages=[{"role": "user", "content": json.dumps(
@@ -130,6 +130,72 @@ def claude_from_files(cfg, tails):
         output_format=Result,
     )
     return resp.parsed_output.components, resp.usage
+
+
+# --------------------------------------------------------------- .git discovery
+def discover_git(gh, paths):
+    """For each compiled file, find the enclosing .git checkout and its origin
+    remote (ground-truth: the file IS that repo's code). Resolve each checkout to
+    its canonical upstream via the GitHub fork-parent. Returns:
+        git_attr : compiled_path -> (canonical_norm, repo_rel_path)
+        checkouts: canonical_norm -> {canonical_url, checkout_url, divergent, files}
+    """
+    dir_cache = {}     # dir -> (checkout_root, origin_url) or (None, None)
+    canon_cache = {}   # checkout_url -> canonical_url
+
+    def root_remote(p):
+        seen, d = [], os.path.dirname(p)
+        while d and d != os.path.dirname(d):
+            if d in dir_cache:
+                r = dir_cache[d]
+                for s in seen:
+                    dir_cache[s] = r
+                return r
+            seen.append(d)
+            if os.path.isdir(os.path.join(d, ".git")):
+                url = None
+                try:
+                    url = subprocess.check_output(["git", "-C", d, "remote", "get-url", "origin"],
+                                                  text=True, stderr=subprocess.DEVNULL).strip()
+                except Exception:
+                    pass
+                r = (d, url)
+                for s in seen:
+                    dir_cache[s] = r
+                return r
+            d = os.path.dirname(d)
+        for s in seen:
+            dir_cache[s] = (None, None)
+        return (None, None)
+
+    def canonical(url):
+        if url in canon_cache:
+            return canon_cache[url]
+        can, (owner, repo) = url, parse_owner_repo(url)
+        if owner:
+            try:
+                info = gh.get(f"/repos/{owner}/{repo}")
+                par = info.get("parent") or info.get("source") or {}
+                if par.get("full_name"):
+                    can = f"https://github.com/{par['full_name']}"
+            except Exception:
+                pass
+        canon_cache[url] = can
+        return can
+
+    git_attr, checkouts = {}, {}
+    for p in paths:
+        root, url = root_remote(p)
+        if not url:
+            continue
+        can = canonical(url)
+        nc = norm_repo(can)
+        rel = p.replace("\\", "/")[len(root.replace("\\", "/")) + 1:] if root else p
+        git_attr[p] = (nc, rel)
+        info = checkouts.setdefault(nc, {"canonical_url": can, "checkout_url": url,
+                                         "divergent": norm_repo(url) != nc, "files": set()})
+        info["files"].add(p)
+    return git_attr, checkouts
 
 
 # --------------------------------------------------------------- GitHub trees
@@ -154,10 +220,6 @@ def fetch_fileset(gh, owner, repo, ref):
             tree.get("truncated", False))
 
 
-def norm_repo(url):
-    return re.sub(r"^https?://", "", (url or "").strip().lower()).rstrip("/").removesuffix(".git")
-
-
 # --------------------------------------------------------------- main
 def main():
     for stream in (sys.stdout, sys.stderr):
@@ -168,8 +230,7 @@ def main():
 
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--emit", type=Path, default=DEFAULT_EMIT)
-    ap.add_argument("--dir", type=Path, default=DEFAULT_DIR,
-                    help="live dir holding the BD hub manifest; outputs written here")
+    ap.add_argument("--dir", type=Path, default=DEFAULT_DIR)
     ap.add_argument("--project", default="repo-mon-stage3-curl")
     ap.add_argument("--version", default="8.11.0")
     args = ap.parse_args()
@@ -177,32 +238,27 @@ def main():
     cfg = load_config()
     primaries, all_compiled = parse_emit(args.emit)
     print(f"[emit] {len(primaries)} primary TUs, {len(all_compiled)} compiled files", flush=True)
+    gh = GH(gh_token())
 
-    # (2) Black Duck side: fetch the BoM live and VCS-resolve it (self-contained,
-    # so re-runs don't read a file this script also overwrites).
+    # candidate repos keyed by normalized url -> dict(name, slug, vcs_url, version,
+    # version_source, [built_from], [divergent])
+    candidates = {}
+
+    # (1) Black Duck content-identity (canonical).
     bd = BDClient(cfg["url"], cfg["api_token"], cfg.get("insecure_tls", False))
-    proj, ver, bom = resolve_project_version(bd, args.project, args.version)
+    _, _, bom = resolve_project_version(bd, args.project, args.version)
     anthropic_client = build_anthropic_client(cfg["anthropic_api_key"])
     bd_repos, _ = enhance_with_claude(anthropic_client, component_context(bom))
-
-    candidates = {}   # norm_url -> {name, slug, vcs_url, version, version_source}
     for r in bd_repos:
-        if not r.vcs_url or not norm_repo(r.vcs_url):
-            continue
-        candidates[norm_repo(r.vcs_url)] = {
-            "name": r.component_name,
-            "slug": r.component_name.lower().replace(" ", "-"),
-            "vcs_url": r.vcs_url,
-            "version": r.component_version,
-            "version_source": "bd",
-        }
+        if r.vcs_url and norm_repo(r.vcs_url):
+            candidates[norm_repo(r.vcs_url)] = {
+                "name": r.component_name, "slug": slugify(r.component_name),
+                "vcs_url": r.vcs_url, "version": r.component_version, "version_source": "bd"}
     print(f"[bd]   {len(candidates)} components in the Black Duck BoM", flush=True)
 
-    # (3) Claude reconstructs components from the compiled file paths.
-    tails = digest_tails(all_compiled)
-    comps, usage = claude_from_files(cfg, tails)
-    print(f"[claude] reconstructed {len(comps)} components from {len(tails)} file tails "
-          f"(tok {usage.input_tokens}/{usage.output_tokens}):", flush=True)
+    # (2) Claude reconstructs components from the compiled file paths (union).
+    comps, usage = claude_from_files(cfg, digest_tails(all_compiled))
+    print(f"[claude] reconstructed {len(comps)} components (tok {usage.input_tokens}/{usage.output_tokens}):", flush=True)
     for c in comps:
         if c.name.strip().lower() in BUILD_TOOLS:
             print(f"    - {c.name}: dropped (build tool, not a shipped component)", flush=True)
@@ -211,92 +267,112 @@ def main():
         new = nk and nk not in candidates
         print(f"    - {c.name} {c.proposed_version or '?'}  {c.vcs_url}  [{c.confidence}]"
               f"{'  <-- NEW (not in BD BoM)' if new else ''}", flush=True)
-        if nk and new:      # (4) union: add repos BD missed, versions marked inferred
-            candidates[nk] = {
-                "name": c.name, "slug": c.name.lower().replace(" ", "-"),
-                "vcs_url": c.vcs_url, "version": c.proposed_version,
-                "version_source": "claude-inferred",
-            }
+        if nk and new:
+            candidates[nk] = {"name": c.name, "slug": slugify(c.name), "vcs_url": c.vcs_url,
+                              "version": c.proposed_version, "version_source": "claude-inferred"}
+
+    # (3) .git discovery on the actual checkouts (ground-truth + fork->canonical).
+    git_attr, checkouts = discover_git(gh, all_compiled)
+    print(f"[git]  {len(checkouts)} checkout(s) discovered on disk:", flush=True)
+    for nc, info in checkouts.items():
+        div = "  DIVERGENT (built from a fork/vendored copy)" if info["divergent"] else ""
+        print(f"    - built from {info['checkout_url']} -> canonical {info['canonical_url']}{div}", flush=True)
+        if nc in candidates:                       # same component -> record provenance
+            candidates[nc]["built_from"] = info["checkout_url"]
+            candidates[nc]["divergent"] = info["divergent"]
+        else:                                       # union: never drop a discovered repo
+            owner, repo = parse_owner_repo(info["canonical_url"])
+            candidates[nc] = {"name": repo or nc, "slug": slugify(repo or nc),
+                              "vcs_url": info["canonical_url"], "version": None,
+                              "version_source": "git-discovered",
+                              "built_from": info["checkout_url"], "divergent": info["divergent"]}
     print(f"[union] {len(candidates)} candidate repos", flush=True)
 
-    # (5) enumerate each candidate repo's file set at its tag.
-    gh = GH(gh_token())
+    # (4) enumerate each candidate repo's file tree (for the longest-suffix fallback).
     filesets = {}
-    for k, cand in candidates.items():
+    for cand in candidates.values():
         owner, repo = parse_owner_repo(cand["vcs_url"])
         if not owner:
             continue
         tag = resolve_tag(gh, owner, repo, cand["version"])
         ref = tag or gh.get(f"/repos/{owner}/{repo}").get("default_branch", "master")
         try:
-            fs, trunc = fetch_fileset(gh, owner, repo, ref)
+            fs, _ = fetch_fileset(gh, owner, repo, ref)
         except Exception as exc:
-            print(f"    ! {owner}/{repo}: tree fetch failed ({exc}); skipping", flush=True)
+            print(f"    ! {owner}/{repo}: tree fetch failed ({exc})", flush=True)
             continue
         cand["ref"] = ref
-        cand["ref_is_tag"] = bool(tag)
         filesets[cand["slug"]] = fs
-        print(f"    {cand['slug']:8} tree@{ref}: {len(fs)} files"
-              f"{' (truncated)' if trunc else ''}", flush=True)
 
-    # (6) attribute every compiled file to a repo (the mapping service).
-    attribution = repo_mapper.attribute(sorted(all_compiled), filesets)
-    prim_attr = {p: attribution.get(p) for p in primaries}
+    # (5) attribution: .git ground-truth first, longest-suffix fallback.
+    slug_of_nc = {nc: c["slug"] for nc, c in candidates.items()}
+    need_suffix = [p for p in all_compiled if p not in git_attr]
+    suffix_attr = repo_mapper.attribute(need_suffix, filesets)
+    combined = {}   # path -> (slug, rel, how)
+    for p in all_compiled:
+        if p in git_attr:
+            nc, rel = git_attr[p]
+            combined[p] = (slug_of_nc.get(nc), rel, "git")
+        else:
+            a = suffix_attr.get(p)
+            combined[p] = ((a.repo, a.rel, "suffix") if a else None)
 
-    # (7) monitored iff a PRIMARY TU landed on the repo.
-    slug_by = {c["slug"]: c for c in candidates.values()}
-    monitored = sorted({a.repo for a in prim_attr.values() if a})
+    # (6) monitored iff a PRIMARY TU landed on the repo (canonical slug).
+    monitored = sorted({combined[p][0] for p in primaries
+                        if combined.get(p) and combined[p][0]})
     print(f"[classify] monitored (own >=1 primary TU): {monitored}", flush=True)
 
-    # compiled-file index: only files attributed to a monitored repo.
-    files, amb = [], 0
-    for cp, a in sorted(attribution.items()):
-        if a and a.repo in monitored:
-            files.append({"path": f"{a.repo}/{a.rel}", "component": a.repo,
+    files = []
+    for cp, c in sorted(combined.items()):
+        if c and c[0] in monitored:
+            files.append({"path": f"{c[0]}/{c[1]}", "component": c[0],
                           "kind": "header" if cp.lower().endswith(HDR_EXT) else "source",
-                          "resolution": "mapper_longest_suffix",
-                          **({"ambiguous": True} if a.ambiguous else {})})
-            amb += a.ambiguous
-    if amb:
-        print(f"[classify] {amb} attributions were ambiguous (issue #4 punt)", flush=True)
+                          "resolution": c[2]})
 
-    # write build-capture.json (monitored index)
+    slug_by = {c["slug"]: c for c in candidates.values()}
     repos_detected = []
     for slug in monitored:
         c = slug_by[slug]
-        repos_detected.append({
-            "local_path": slug, "associated_component": slug,
-            "pinned_ref": c.get("ref") or c.get("version"),
-            "vcs_urls": [{"url": c["vcs_url"], "relationship": "upstream", "found_in": "bdcpp+mapper"}],
-        })
+        entry = {"local_path": slug, "associated_component": slug,
+                 "pinned_ref": c.get("ref") or c.get("version"),
+                 "vcs_urls": [{"url": c["vcs_url"], "relationship": "upstream",
+                               "found_in": "bdcpp+mapper"}]}
+        if c.get("built_from"):
+            entry["built_from"] = c["built_from"]
+            entry["divergent"] = c.get("divergent", False)
+        repos_detected.append(entry)
     (args.dir / "build-capture.json").write_text(json.dumps({
-        "_comment": ("Compiled-file index from a REAL BD/CPP capture, attributed to "
-                     "repos by the mapping service (longest-suffix) over union(BD BoM, "
-                     "Claude-from-files). Monitored = owns >=1 primary translation unit."),
+        "_comment": ("Compiled-file index from a REAL BD/CPP capture, attributed by "
+                     ".git ground-truth (fork resolved to canonical) with longest-suffix "
+                     "fallback, over union(BD BoM, Claude-from-files, .git). Anchored on "
+                     "the CANONICAL repo so upstream security commits match; a divergent "
+                     "local checkout is recorded as provenance, not a second watch target."),
         "project": args.project, "build_id": f"{args.project}@{args.version}",
         "repos_detected": repos_detected, "files": files,
     }, indent=2), encoding="utf-8")
 
-    # rewrite hub-api-components.json as the union manifest with version_source
     items = []
     for c in candidates.values():
-        items.append({
-            "componentName": c["name"], "componentVersionName": c.get("version") or "?",
-            "vcsUrl": c["vcs_url"], "versionSource": c["version_source"],
-            "monitored_hint": c["slug"] in monitored,
-        })
+        it = {"componentName": c["name"], "componentVersionName": c.get("version") or "?",
+              "vcsUrl": c["vcs_url"], "versionSource": c["version_source"],
+              "monitored_hint": c["slug"] in monitored}
+        if c.get("built_from"):
+            it["builtFrom"] = c["built_from"]
+            it["divergent"] = c.get("divergent", False)
+        items.append(it)
     (args.dir / "hub-api-components.json").write_text(json.dumps({
-        "_comment": ("Union watch manifest: Black Duck BoM UNION Claude-from-compiled-"
-                     "files. versionSource=bd is authoritative; claude-inferred is a best "
-                     "estimate and the UI flags it."),
+        "_comment": "Union watch manifest: Black Duck BoM UNION Claude-from-files UNION .git checkouts.",
         "project": args.project, "version": args.version,
         "totalCount": len(items), "items": items,
     }, indent=2), encoding="utf-8")
 
-    print(f"[write] build-capture.json: {len(files)} indexed files for {monitored}", flush=True)
-    print(f"[write] hub-api-components.json: {len(items)} union repos", flush=True)
     ref_only = [c["slug"] for c in candidates.values() if c["slug"] not in monitored]
+    print(f"[write] build-capture.json: {len(files)} indexed files for {monitored}", flush=True)
     print(f"[result] monitored={monitored}  reference-only={ref_only}", flush=True)
+    for c in candidates.values():
+        if c.get("divergent"):
+            print(f"[provenance] {c['slug']}: monitoring canonical {c['vcs_url']}, "
+                  f"BUILT FROM divergent local copy {c['built_from']}", flush=True)
 
 
 if __name__ == "__main__":

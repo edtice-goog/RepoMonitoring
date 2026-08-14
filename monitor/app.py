@@ -102,6 +102,10 @@ class MonitorState:
                 w = self.watch_by_url.get(norm_url(url))
                 if w is not None:
                     w["version_source"] = item.get("versionSource", "bd")
+                    # Provenance: we monitor the canonical, but the build may have
+                    # used a local/vendored copy that diverges from it.
+                    w["built_from"] = item.get("builtFrom")
+                    w["divergent"] = item.get("divergent", False)
 
         # Compiled-file index: strip each file's repo-local prefix so paths
         # are upstream-repo-relative, ready for suffix matching.
@@ -272,9 +276,19 @@ def render_dashboard(state: MonitorState) -> str:
                     "Black Duck did not identify this component'>≈ inferred</span>")
         return ref
 
+    def _url(w):
+        u = f"<code>{esc(w['url'])}</code>"
+        bf = w.get("built_from")
+        if bf and norm_url(bf) != norm_url(w["url"]):
+            warn = " ⚠ divergent" if w.get("divergent") else ""
+            u += (f"<br><span class='muted' title='This build used a local/vendored copy; "
+                  f"the canonical upstream is what we monitor'>↳ built from <code>{esc(bf)}</code>"
+                  f"{warn}</span>")
+        return u
+
     def _rows(ws):
         return "".join(
-            f"<tr><td>{esc(w['component'])}</td><td><code>{esc(w['url'])}</code></td>"
+            f"<tr><td>{esc(w['component'])}</td><td>{_url(w)}</td>"
             f"<td>{esc(w['relationship'])}</td><td>{esc(', '.join(w['provenance']))}</td>"
             f"<td>{_pin(w)}</td></tr>"
             for w in ws)

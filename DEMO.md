@@ -149,13 +149,23 @@ not monitored*, and OpenSSL's commits marked `not_monitored` (short-circuited at
 the repo level — never relevance-filtered or triaged). A version Black Duck
 couldn't supply (a repo only Claude spotted) is shown with an `≈ inferred` flag.
 
-> **Known limitation (next up):** when a compiled file's path exists in more than
-> one candidate repo — a vendor **fork** and its **upstream**, or a repo that
-> **vendors a copy** of a dependency (CMake bundles curl+zlib, which is why it's
-> filtered) — longest-suffix can't tell them apart and breaks the tie
-> arbitrarily. This is the first objection an audience will raise; the
-> `Attribution.ambiguous` flag marks these, and proper disambiguation is the
-> planned follow-up in `repo_mapper.py`.
+**Vendored / forked copies.** Building from source often means *vendor edits* — a
+local fork. We must not be fooled into monitoring the inert local copy; security
+patches land in the **canonical** project repo. `attribute_capture` handles this
+via **`.git` discovery**: each compiled file's enclosing checkout and `origin`
+remote are read (ground-truth attribution — no path guessing), and a fork is
+resolved to its canonical via the GitHub **fork-parent**. We then **monitor the
+canonical**, and record the local checkout as **divergent provenance** shown as
+`↳ built from <fork> ⚠ divergent` under the repo. Demonstrated by forking
+`madler/zlib` → `edtice-goog/zlib`, editing `compress.c`, and rebuilding: zlib is
+monitored on `madler/zlib` with the fork flagged, curl on `curl/curl` (no
+divergence), OpenSSL reference-only.
+
+> **Still open (next):** a copy vendored *inside another repo* with no `.git` of
+> its own (e.g. CMake's bundled `cmzlib`) can't be split by `.git`; it currently
+> relies on the build-tool exclusion + longest-suffix, and the `Attribution.ambiguous`
+> flag marks genuine same-path collisions. Full disambiguation lives in
+> `repo_mapper.py`.
 
 ### Prerequisites for live mode
 
