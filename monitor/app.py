@@ -29,7 +29,7 @@ import json
 import urllib.error
 import urllib.request
 from datetime import datetime, timezone
-from http.server import BaseHTTPRequestHandler, HTTPServer
+from http.server import BaseHTTPRequestHandler, HTTPServer, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, quote, unquote, urlparse
 
@@ -526,7 +526,10 @@ def main() -> None:
               f"{sum(len(v) for v in ps.file_index.values())} indexed files")
     print(f"[monitor] dashboard http://127.0.0.1:{args.port}/  "
           f"webhook POST http://127.0.0.1:{args.port}/webhook")
-    HTTPServer(("127.0.0.1", args.port), MonitorHandler).serve_forever()
+    # Threaded so the dashboard stays responsive while a live triage call is in
+    # flight (a cold Claude triage can take tens of seconds); a single-threaded
+    # server would block every GET behind the webhook being processed.
+    ThreadingHTTPServer(("127.0.0.1", args.port), MonitorHandler).serve_forever()
 
 
 if __name__ == "__main__":

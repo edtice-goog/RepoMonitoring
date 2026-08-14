@@ -294,12 +294,15 @@ def main():
         owner, repo = parse_owner_repo(cand["vcs_url"])
         if not owner:
             continue
-        tag = resolve_tag(gh, owner, repo, cand["version"])
-        ref = tag or gh.get(f"/repos/{owner}/{repo}").get("default_branch", "master")
         try:
+            tag = resolve_tag(gh, owner, repo, cand["version"])
+            ref = tag or gh.get(f"/repos/{owner}/{repo}").get("default_branch", "master")
             fs, _ = fetch_fileset(gh, owner, repo, ref)
         except Exception as exc:
-            print(f"    ! {owner}/{repo}: tree fetch failed ({exc})", flush=True)
+            # A candidate whose repo can't be resolved (e.g. a BoM component
+            # mapped to a non-existent GitHub repo) is skipped for suffix
+            # attribution but kept in the SBOM/union — never fatal to the run.
+            print(f"    ! {owner}/{repo}: skipped, tree unavailable ({exc})", flush=True)
             continue
         cand["ref"] = ref
         filesets[cand["slug"]] = fs

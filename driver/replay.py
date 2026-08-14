@@ -51,14 +51,23 @@ def send(webhook_url: str, event: dict) -> None:
         method="POST",
     )
     try:
-        with urllib.request.urlopen(req, timeout=15) as resp:
+        with urllib.request.urlopen(req, timeout=200) as resp:
             result = json.loads(resp.read())
     except (urllib.error.URLError, TimeoutError) as exc:
         print(f"  !! webhook delivery failed: {exc}")
         return
-    for c in result.get("commits", []):
-        verdict = f" verdict={c['verdict']}" if c.get("verdict") else ""
-        print(f"  -> commit {c['commit'][:12]}: {c['status']}{verdict}")
+    # The monitor webhook is multi-project: it answers {"status":"routed",
+    # "projects":[{"project", "status", "commits":[...]}]}. A single-project
+    # setup (or an unmatched repo) answers the flat {"status","commits"} shape.
+    # Handle both so verdicts print either way.
+    routes = result.get("projects")
+    if routes is None:
+        routes = [result]
+    for r in routes:
+        label = f"[{r['project']}] " if r.get("project") else ""
+        for c in r.get("commits", []):
+            verdict = f" verdict={c['verdict']}" if c.get("verdict") else ""
+            print(f"  -> {label}commit {c['commit'][:12]}: {c['status']}{verdict}")
     if result.get("status") == "ignored":
         print(f"  -> ignored: {result.get('reason')}")
 
