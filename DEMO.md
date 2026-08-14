@@ -19,7 +19,7 @@ machine (`py` on some Windows installs, `python3` on Linux/macOS).
 
 | Path | What it is |
 |---|---|
-| `monitor/app.py` | The monitoring component: web dashboard + Git webhook endpoint |
+| `monitor/app.py` | The monitoring component: multi-project web dashboard + Git webhook endpoint |
 | `triage-service/server.py` | Stub "LLM triage service" (deterministic truth table) |
 | `driver/replay.py` | Fires simulated upstream commits at the monitor as standard Git webhooks |
 | `samples/` | Fictitious tool artifacts: build capture, SBOMs (3 formats), commit events, triage verdicts |
@@ -48,17 +48,25 @@ cd <unzipped folder>
 python monitor/app.py
 ```
 
-You should see it load **4 watched repos** and **27 indexed files**, then:
+You should see it list **1 project** (`acme-gw7100-firmware`) with its watched
+repos and indexed files, then:
 `[monitor] dashboard http://127.0.0.1:8378/ ...`
 
 ### 3. Open the dashboard
 
 Browse to **http://127.0.0.1:8378/** — it refreshes itself every 3 seconds.
 
-You'll see the **watch manifest**: the repos derived from the build capture
-and SBOM, including both ACME's internal kernel fork *and* its kernel.org
-upstream (fixes land upstream first; the fork is what gets built), with
-provenance for how each URL was discovered.
+The landing page is the **project list**: one row per Black Duck SCA project
+(1:1), with its component / monitored / reference-only counts and event tallies.
+Click a project to drill in. Each project's page shows its **watch manifest**:
+the repos derived from that project's build capture and SBOM, including both
+ACME's internal kernel fork *and* its kernel.org upstream (fixes land upstream
+first; the fork is what gets built), with provenance for how each URL was
+discovered. Load several projects at once by repeating `--data-dir` — e.g.
+`python monitor/app.py --data-dir samples --data-dir live --data-dir live-stage3`
+gives a three-project landing page you can drill into and filter events by.
+(A push to a shared upstream — zlib, OpenSSL — routes to *every* project that
+watches it, so one upstream fix fans out across all affected projects.)
 
 ### 4. Fire the simulated commit events (terminal 3)
 

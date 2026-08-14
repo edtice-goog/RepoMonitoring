@@ -1,24 +1,26 @@
 """RepoMonitoring — monitoring component (demo web application).
 
-In production this component would subscribe to a notification API fed by new
-BD/CPP analyses; for the demo it reads the capture and SBOM artifacts from
-disk at startup. It exposes:
+Multi-project. Each --data-dir is one Black Duck SCA project (1:1). The landing
+page lists the projects; drilling into one shows its watch manifest and the
+commit events for that project. In production this is fed by the BD SCA
+notification API; the demo reads the capture + SBOM artifacts from disk.
 
-    GET  /            HTML dashboard (watch manifest, alerts, review queue, log)
-    GET  /health      service health
-    GET  /api/watches watch manifest as JSON
-    GET  /api/results processed commit results as JSON
-    POST /webhook     Git webhook (GitHub push-event format)
+    GET  /                     project list (landing)
+    GET  /?project=<name>      one project: watch manifest + its commit events
+    GET  /health               service health
+    GET  /api/projects         project summaries as JSON
+    GET  /api/watches?project=  watch manifest as JSON
+    GET  /api/results?project=  processed commit results as JSON
+    POST /webhook              Git webhook; routed to every project watching the repo
 
-Webhook semantics: the commit hash is the unit of selection and triage. For
-each commit in the payload, the changed files are compared against the
-compiled-file index. If at least one file is in scope, the commit is selected
-and ALL of its in-scope files are sent together in one call to the LLM triage
-service. Commits with no in-scope files are suppressed (and logged with the
-reason). Repos not in the watch manifest are ignored (and logged).
+Webhook semantics (per project): the commit hash is the unit of selection and
+triage. Changed files are compared against that project's compiled-file index;
+a commit with >=1 in-scope file is triaged (all in-scope files together), else
+suppressed. A commit on a reference-only repo is not_monitored. An incoming push
+is routed to EVERY project whose watch manifest contains the repo.
 
 Usage:
-    python app.py [--port 8378] [--data-dir ../samples]
+    python app.py [--port 8378] [--data-dir DIR ...]
                   [--triage-url http://127.0.0.1:8377/triage]
 """
 
@@ -29,6 +31,7 @@ import urllib.request
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
+from urllib.parse import parse_qs, quote, unquote, urlparse
 
 DEFAULT_DATA_DIR = Path(__file__).resolve().parent.parent / "samples"
 DEFAULT_TRIAGE_URL = "http://127.0.0.1:8377/triage"
@@ -51,11 +54,16 @@ def now_iso() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
-# --------------------------------------------------------------- state
-class MonitorState:
+def esc(s):
+    return str(s).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
+# --------------------------------------------------------------- per-project state
+class ProjectState:
     def __init__(self, data_dir: Path, triage_url: str):
         self.data_dir = data_dir
         self.triage_url = triage_url
+        self.name = "?"            # registry key (defaults to project)
         self.watches = []          # watch manifest entries
         self.watch_by_url = {}     # norm_url -> watch entry
         self.file_index = {}       # component -> [{rel, kind}]
@@ -263,12 +271,101 @@ class MonitorState:
                               "verdict": base.get("triage", {}).get("verdict")})
         return {"status": "processed", "commits": summaries}
 
+    # ----------------------------------------------------------- summary
+    def summary(self) -> dict:
+        comps = {w["component"] for w in self.watches}
+        mon = {w["component"] for w in self.watches if w.get("monitored")}
+        alerts = sum(1 for r in self.results
+                     if (r.get("triage") or {}).get("verdict") == "response_required")
+        review = sum(1 for r in self.results
+                     if (r.get("triage") or {}).get("verdict") == "needs_human_review")
+        last = self.results[0]["received_at"] if self.results else "—"
+        return {"name": self.name, "project": self.project, "build_id": self.build_id,
+                "components": len(comps), "monitored": len(mon),
+                "reference_only": len(comps) - len(mon), "events": len(self.results),
+                "alerts": alerts, "needs_review": review, "last_activity": last}
 
-# --------------------------------------------------------------- dashboard
-def render_dashboard(state: MonitorState) -> str:
-    def esc(s):
-        return str(s).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
+# --------------------------------------------------------------- registry
+class Registry:
+    def __init__(self, data_dirs, triage_url: str):
+        self.triage_url = triage_url
+        self.projects = {}         # name -> ProjectState (insertion order)
+        for d in data_dirs:
+            ps = ProjectState(Path(d), triage_url)
+            name, base, i = ps.project, ps.project, 2
+            while name in self.projects:
+                name = f"{base} ({i})"
+                i += 1
+            ps.name = name
+            self.projects[name] = ps
+
+    def process_push(self, payload: dict) -> dict:
+        repo_url = (payload.get("repository") or {}).get("clone_url") \
+            or (payload.get("repository") or {}).get("url") or ""
+        key = norm_url(repo_url) if repo_url else ""
+        matched = [(n, p) for n, p in self.projects.items() if key and p.watch_by_url.get(key)]
+        if not matched:
+            return {"status": "ignored", "reason": "repository not watched by any project",
+                    "repo": repo_url}
+        return {"status": "routed",
+                "projects": [{"project": n, **p.process_push(payload)} for n, p in matched]}
+
+
+# --------------------------------------------------------------- rendering
+_STYLE = """
+ body { font-family: Segoe UI, sans-serif; margin: 24px; color: #21212B; }
+ a { color: #582C83; }
+ h1 { font-size: 22px; } h2 { font-size: 16px; margin-top: 28px; color: #582C83; }
+ table { border-collapse: collapse; width: 100%; font-size: 13px; }
+ th, td { text-align: left; padding: 6px 10px; border-bottom: 1px solid #ddd; }
+ th { color: #582C83; }
+ code { background: #f4f2f8; padding: 1px 4px; border-radius: 3px; font-size: 12px; }
+ .card { background: #fafafa; margin: 8px 0; padding: 10px 14px; border-radius: 4px; }
+ .badge { color: white; padding: 2px 8px; border-radius: 10px; font-size: 12px; }
+ .muted { color: #6B6B76; font-size: 12px; margin-top: 4px; }
+ .rationale { font-size: 13px; margin-top: 6px; }
+ .pill { display:inline-block; min-width:18px; text-align:center; padding:1px 7px;
+         border-radius:10px; font-size:12px; color:white; }
+"""
+
+
+def _page(title: str, body: str) -> bytes:
+    return (f"""<!DOCTYPE html>
+<html><head><meta charset="utf-8"><meta http-equiv="refresh" content="3">
+<title>{esc(title)}</title><style>{_STYLE}</style></head><body>{body}</body></html>""").encode("utf-8")
+
+
+def render_project_list(reg: Registry) -> bytes:
+    def pill(n, color):
+        return f"<span class='pill' style='background:{color}'>{n}</span>" if n else \
+               f"<span class='muted'>0</span>"
+    rows = ""
+    for name, ps in reg.projects.items():
+        s = ps.summary()
+        rows += (
+            f"<tr><td><a href='/?project={quote(name)}'><b>{esc(name)}</b></a>"
+            f"<div class='muted'><code>{esc(s['build_id'])}</code></div></td>"
+            f"<td>{s['components']}</td>"
+            f"<td>{s['monitored']}</td>"
+            f"<td>{s['reference_only']}</td>"
+            f"<td>{s['events']}</td>"
+            f"<td>{pill(s['alerts'], '#C0392B')}</td>"
+            f"<td>{pill(s['needs_review'], '#B9770E')}</td>"
+            f"<td class='muted'>{esc(s['last_activity'])}</td></tr>")
+    body = f"""
+<h1>RepoMonitoring <span class="muted">— {len(reg.projects)} project(s)</span></h1>
+<p class="muted">Each project is one Black Duck SCA analysis. Select a project to see its
+watched repositories and the upstream commit events being triaged. Triage backend:
+<code>{esc(reg.triage_url)}</code>.</p>
+<table>
+<tr><th>Project</th><th>Components</th><th>Monitored</th><th>Reference-only</th>
+<th>Events</th><th>Response&nbsp;req.</th><th>Needs&nbsp;review</th><th>Last activity</th></tr>
+{rows}</table>"""
+    return _page("RepoMonitoring — projects", body)
+
+
+def render_project(reg: Registry, ps: ProjectState) -> bytes:
     def _pin(w):
         ref = f"<code>{esc(w['pinned_ref'] or '—')}</code>"
         if w.get("version_source") == "claude-inferred":
@@ -293,10 +390,9 @@ def render_dashboard(state: MonitorState) -> str:
             f"<td>{_pin(w)}</td></tr>"
             for w in ws)
 
-    mon = [w for w in state.watches if w.get("monitored", True)]
-    ref = [w for w in state.watches if not w.get("monitored", True)]
-    watch_rows = _rows(mon)
-    comps = {w["component"] for w in state.watches}
+    mon = [w for w in ps.watches if w.get("monitored", True)]
+    ref = [w for w in ps.watches if not w.get("monitored", True)]
+    comps = {w["component"] for w in ps.watches}
     mon_comps = {w["component"] for w in mon}
     funnel = (f"SBOM (Black Duck): {len(comps)} component(s) &rarr; "
               f"compiled from source (BD/CPP): {len(mon_comps)} &rarr; "
@@ -330,40 +426,25 @@ def render_dashboard(state: MonitorState) -> str:
             f"<div class='muted'>in scope: {files}</div>"
             f"<div class='rationale'>{rationale}</div></div>")
 
-    cards = "".join(result_card(r) for r in state.results) or \
-        "<p class='muted'>No commit events received yet. POST a push payload to /webhook.</p>"
+    cards = "".join(result_card(r) for r in ps.results) or \
+        "<p class='muted'>No commit events received yet for this project.</p>"
 
-    return f"""<!DOCTYPE html>
-<html><head><meta charset="utf-8"><meta http-equiv="refresh" content="3">
-<title>RepoMonitoring — {esc(state.project)}</title>
-<style>
- body {{ font-family: Segoe UI, sans-serif; margin: 24px; color: #21212B; }}
- h1 {{ font-size: 22px; }} h2 {{ font-size: 16px; margin-top: 28px; color: #582C83; }}
- table {{ border-collapse: collapse; width: 100%; font-size: 13px; }}
- th, td {{ text-align: left; padding: 5px 10px; border-bottom: 1px solid #ddd; }}
- th {{ color: #582C83; }}
- code {{ background: #f4f2f8; padding: 1px 4px; border-radius: 3px; font-size: 12px; }}
- .card {{ background: #fafafa; margin: 8px 0; padding: 10px 14px; border-radius: 4px; }}
- .badge {{ color: white; padding: 2px 8px; border-radius: 10px; font-size: 12px; }}
- .muted {{ color: #6B6B76; font-size: 12px; margin-top: 4px; }}
- .rationale {{ font-size: 13px; margin-top: 6px; }}
-</style></head><body>
-<h1>RepoMonitoring <span class="muted">— {esc(state.project)} ({esc(state.build_id)})</span></h1>
-<p class="muted">Demo monitoring component. Data loaded from disk; in production this is fed by the
-BD SCA notification API. Triage backend: <code>{esc(state.triage_url)}</code> (stub).</p>
+    body = f"""
+<p><a href="/">&larr; Projects</a></p>
+<h1>{esc(ps.name)} <span class="muted">({esc(ps.build_id)})</span></h1>
 <p class="muted" style="font-size:13px"><b>Precision funnel:</b> {funnel}</p>
 <h2>Monitored repos ({len(mon)})</h2>
 <table><tr><th>Component</th><th>VCS URL</th><th>Relationship</th><th>Provenance</th><th>Pinned ref</th></tr>
-{watch_rows}</table>
+{_rows(mon)}</table>
 {ref_section}
-<h2>Commit events ({len(state.results)})</h2>
-{cards}
-</body></html>"""
+<h2>Commit events ({len(ps.results)})</h2>
+{cards}"""
+    return _page(f"RepoMonitoring — {ps.name}", body)
 
 
 # --------------------------------------------------------------- http server
 class MonitorHandler(BaseHTTPRequestHandler):
-    state: MonitorState = None
+    reg: Registry = None
 
     def _send(self, status: int, body: bytes, ctype: str) -> None:
         self.send_response(status)
@@ -376,16 +457,32 @@ class MonitorHandler(BaseHTTPRequestHandler):
         self._send(status, json.dumps(payload, indent=2).encode(), "application/json")
 
     def do_GET(self) -> None:
-        if self.path == "/" or self.path.startswith("/?"):
-            self._send(200, render_dashboard(self.state).encode("utf-8"),
-                       "text/html; charset=utf-8")
-        elif self.path == "/health":
+        parsed = urlparse(self.path)
+        qs = parse_qs(parsed.query)
+        project = unquote(qs["project"][0]) if "project" in qs else None
+
+        if parsed.path == "/":
+            if project:
+                ps = self.reg.projects.get(project)
+                if ps is None:
+                    self._send_json(404, {"error": f"unknown project {project}"})
+                else:
+                    self._send(200, render_project(self.reg, ps), "text/html; charset=utf-8")
+            else:
+                self._send(200, render_project_list(self.reg), "text/html; charset=utf-8")
+        elif parsed.path == "/health":
             self._send_json(200, {"status": "ok", "service": "repo-monitor",
-                                  "watches": len(self.state.watches)})
-        elif self.path == "/api/watches":
-            self._send_json(200, self.state.watches)
-        elif self.path == "/api/results":
-            self._send_json(200, self.state.results)
+                                  "projects": len(self.reg.projects)})
+        elif parsed.path == "/api/projects":
+            self._send_json(200, [p.summary() for p in self.reg.projects.values()])
+        elif parsed.path == "/api/watches":
+            ps = self.reg.projects.get(project)
+            self._send_json(200, ps.watches if ps else
+                            {n: p.watches for n, p in self.reg.projects.items()})
+        elif parsed.path == "/api/results":
+            ps = self.reg.projects.get(project)
+            self._send_json(200, ps.results if ps else
+                            {n: p.results for n, p in self.reg.projects.items()})
         else:
             self._send_json(404, {"error": f"unknown path {self.path}"})
 
@@ -407,7 +504,7 @@ class MonitorHandler(BaseHTTPRequestHandler):
         except (ValueError, json.JSONDecodeError):
             self._send_json(400, {"error": "body must be valid JSON"})
             return
-        self._send_json(200, self.state.process_push(payload))
+        self._send_json(200, self.reg.process_push(payload))
 
     def log_message(self, fmt, *args):
         print(f"[monitor] {self.address_string()} {fmt % args}")
@@ -416,14 +513,17 @@ class MonitorHandler(BaseHTTPRequestHandler):
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--port", type=int, default=8378)
-    parser.add_argument("--data-dir", type=Path, default=DEFAULT_DATA_DIR)
+    parser.add_argument("--data-dir", type=Path, action="append", dest="data_dirs",
+                        help="a project data dir (repeatable; one per BD SCA project)")
     parser.add_argument("--triage-url", default=DEFAULT_TRIAGE_URL)
     args = parser.parse_args()
 
-    MonitorHandler.state = MonitorState(args.data_dir, args.triage_url)
-    print(f"[monitor] {MonitorHandler.state.project} ({MonitorHandler.state.build_id}): "
-          f"{len(MonitorHandler.state.watches)} watched repos, "
-          f"{sum(len(v) for v in MonitorHandler.state.file_index.values())} indexed files")
+    data_dirs = args.data_dirs or [DEFAULT_DATA_DIR]
+    MonitorHandler.reg = Registry(data_dirs, args.triage_url)
+    print(f"[monitor] {len(MonitorHandler.reg.projects)} project(s):")
+    for name, ps in MonitorHandler.reg.projects.items():
+        print(f"[monitor]   {name}: {len(ps.watches)} repos, "
+              f"{sum(len(v) for v in ps.file_index.values())} indexed files")
     print(f"[monitor] dashboard http://127.0.0.1:{args.port}/  "
           f"webhook POST http://127.0.0.1:{args.port}/webhook")
     HTTPServer(("127.0.0.1", args.port), MonitorHandler).serve_forever()
