@@ -54,6 +54,7 @@ def recreate_project(name, out_dir, refresh_sbom=False, refresh_events=False,
                        "actual_source_ref": p.actual_source_ref,
                        "divergent": p.divergent} for p in proj.provenance]
         bd_version = proj.bd_version
+        overrides = proj.overrides or {}
     log(f"[seed] {len(primaries)} primary TUs, {len(all_compiled)} compiled files, "
         f"{len(provenance)} provenance rows")
 
@@ -69,6 +70,14 @@ def recreate_project(name, out_dir, refresh_sbom=False, refresh_events=False,
         return component_context(comps)
     sbom = cache.cached("sbom", {"project": name, "version": bd_version},
                         sbom_producer, refresh=refresh_sbom)
+    # Per-component version override (demo re-point without re-scanning): monitor a
+    # different release than BD scanned. Applied before vcs/watch/tree so the pinned
+    # tag, watch branch, and file-scope ref all follow the override.
+    for c in sbom:
+        ov = overrides.get(slugify(c["componentName"]))
+        if ov:
+            log(f"[override] {c['componentName']} {c['componentVersionName']} -> {ov}")
+            c["componentVersionName"] = ov
     log(f"[sbom] {len(sbom)} components")
 
     # ---------- (2) vcs-enhance, per component (only new ones miss) ----------

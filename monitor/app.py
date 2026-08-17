@@ -36,7 +36,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, quote, unquote, urlparse
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))  # repo root (for provisioning.*)
+REPO_ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(REPO_ROOT))  # repo root (for provisioning.* / db.*)
 
 DEFAULT_TRIAGE_URL = "http://127.0.0.1:8377/triage"
 
@@ -524,14 +525,51 @@ class Registry:
     def __init__(self, data_dirs, triage_url: str):
         self.triage_url = triage_url
         self.projects = {}         # name -> ProjectState (insertion order)
+        self.add_status = {"state": "idle", "message": None, "error": None, "at": None}
+        self.add_lock = threading.Lock()
         for d in data_dirs:
-            ps = ProjectState(Path(d), triage_url)
-            name, base, i = ps.project, ps.project, 2
-            while name in self.projects:
-                name = f"{base} ({i})"
-                i += 1
-            ps.name = name
-            self.projects[name] = ps
+            self._register(ProjectState(Path(d), triage_url))
+
+    def _register(self, ps: "ProjectState") -> str:
+        name, base, i = ps.project, ps.project, 2
+        while name in self.projects:
+            name = f"{base} ({i})"
+            i += 1
+        ps.name = name
+        self.projects[name] = ps
+        return name
+
+    def add_project(self, data_dir) -> str:
+        """Load a project's data dir into the running monitor (no restart)."""
+        return self._register(ProjectState(Path(data_dir), self.triage_url))
+
+    def db_projects_not_loaded(self):
+        """Names of projects seeded in Postgres that aren't loaded in the monitor yet."""
+        try:
+            from db.session import SessionLocal
+            from db.models import Project
+            with SessionLocal() as s:
+                names = [p.name for p in s.query(Project).all()]
+        except Exception:
+            return []
+        loaded = {ps.project for ps in self.projects.values()}
+        return [n for n in names if n not in loaded]
+
+    def run_add(self, project_name):
+        """Recreate a seeded project into its own data dir and register it live."""
+        try:
+            import re
+            from provisioning.recreate import recreate_project
+            slug = re.sub(r"[^a-z0-9._-]+", "-", project_name.lower()).strip("-")
+            data_dir = REPO_ROOT / f"live-{slug}"
+            recreate_project(project_name, data_dir, refresh_sbom=True, log=lambda m: None)
+            name = self.add_project(data_dir)
+            self.projects[name].replay_events()   # restore any cached events (0 tokens)
+            self.add_status = {"state": "done", "message": f"added {name}", "error": None,
+                               "at": now_iso()}
+        except Exception as exc:
+            self.add_status = {"state": "error", "message": None, "error": repr(exc),
+                               "at": now_iso()}
 
     def process_push(self, payload: dict) -> dict:
         repo_url = (payload.get("repository") or {}).get("clone_url") \
@@ -591,6 +629,30 @@ def render_project_list(reg: Registry) -> bytes:
             f"<td>{pill(s['alerts'], '#C0392B')}</td>"
             f"<td>{pill(s['needs_review'], '#B9770E')}</td>"
             f"<td class='muted'>{esc(s['last_activity'])}</td></tr>")
+    # Add-a-project: seeded in Postgres but not yet loaded — recreate + register live.
+    available = reg.db_projects_not_loaded()
+    ast = reg.add_status
+    add_rows = "".join(
+        f"<li style='margin:3px 0'><code>{esc(n)}</code> "
+        f"<button onclick=\"this.disabled=true;fetch('/projects/add?project={quote(n)}',"
+        f"{{method:'POST'}}).then(()=>setTimeout(()=>location.reload(),900))\" "
+        f"style='background:#582C83;color:#fff;border:0;border-radius:4px;padding:3px 9px;"
+        f"cursor:pointer;font-size:12px'>+ Add</button></li>" for n in available)
+    if ast["state"] == "running":
+        add_stat = f"<span style='color:#B9770E'>{esc(ast['message'])}&hellip;</span>"
+    elif ast["state"] == "done":
+        add_stat = f"<span style='color:#2E7D32'>{esc(ast['message'])}</span>"
+    elif ast["state"] == "error":
+        add_stat = f"<span style='color:#C0392B'>add error: {esc(ast['error'])}</span>"
+    else:
+        add_stat = ""
+    add_section = ""
+    if available or ast["state"] != "idle":
+        add_section = (
+            f"<h2>Add a project</h2><p class='muted'>Seeded in Postgres but not loaded — "
+            f"recreate + load into the running monitor, no restart. {add_stat}</p>"
+            f"<ul style='list-style:none;padding-left:0'>{add_rows or '<li class=muted>none pending</li>'}</ul>")
+
     body = f"""
 <h1>RepoMonitoring <span class="muted">— {len(reg.projects)} project(s)</span></h1>
 <p class="muted">Each project is one Black Duck SCA analysis. Select a project to see its
@@ -599,7 +661,8 @@ watched repositories and the upstream commit events being triaged. Triage backen
 <table>
 <tr><th>Project</th><th>Components</th><th>Monitored</th><th>Reference-only</th>
 <th>Events</th><th>Response&nbsp;req.</th><th>Needs&nbsp;review</th><th>Last activity</th></tr>
-{rows}</table>"""
+{rows}</table>
+{add_section}"""
     return _page("RepoMonitoring — projects", body)
 
 
@@ -925,6 +988,9 @@ class MonitorHandler(BaseHTTPRequestHandler):
                                   "projects": len(self.reg.projects)})
         elif parsed.path == "/api/projects":
             self._send_json(200, [p.summary() for p in self.reg.projects.values()])
+        elif parsed.path == "/api/db-projects":
+            self._send_json(200, {"available": self.reg.db_projects_not_loaded(),
+                                  "add_status": self.reg.add_status})
         elif parsed.path == "/api/watches":
             ps = self.reg.projects.get(project)
             self._send_json(200, ps.watches if ps else
@@ -938,6 +1004,26 @@ class MonitorHandler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:
         parsed = urlparse(self.path)
+
+        # UI action: load a seeded (Postgres) project into the running monitor — no restart.
+        if parsed.path == "/projects/add":
+            qs = parse_qs(parsed.query)
+            project = unquote(qs["project"][0]) if "project" in qs else None
+            if not project:
+                self._send_json(400, {"error": "missing project"})
+                return
+            if project in self.reg.projects:
+                self._send_json(409, {"error": "already loaded"})
+                return
+            with self.reg.add_lock:
+                if self.reg.add_status["state"] == "running":
+                    self._send_json(409, {"status": "busy"})
+                    return
+                self.reg.add_status = {"state": "running", "message": f"adding {project}",
+                                       "error": None, "at": now_iso()}
+            threading.Thread(target=self.reg.run_add, args=(project,), daemon=True).start()
+            self._send_json(202, {"status": "started", "project": project})
+            return
 
         # UI action: recreate a project's artifacts from DB seeds + cache (background).
         if parsed.path == "/recreate":

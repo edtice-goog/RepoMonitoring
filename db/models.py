@@ -16,7 +16,7 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 
-from sqlalchemy import Boolean, DateTime, ForeignKey, String, Text, UniqueConstraint
+from sqlalchemy import JSON, Boolean, DateTime, ForeignKey, String, Text, UniqueConstraint
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
 
@@ -35,6 +35,10 @@ class Project(Base):
     name: Mapped[str] = mapped_column(String(200), unique=True, index=True)
     bd_project_url: Mapped[str] = mapped_column(Text)          # the BD SCA project link
     bd_version: Mapped[str] = mapped_column(String(100))
+    # Optional per-component version overrides {component_slug: version}. Lets the demo
+    # monitor a different release (e.g. curl -> a recent tag) than the one BD scanned,
+    # without re-scanning — the compiled file set is version-stable.
+    overrides: Mapped[dict | None] = mapped_column(JSON, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
 
     captures: Mapped[list["Capture"]] = relationship(

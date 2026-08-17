@@ -39,11 +39,15 @@ def main() -> None:
     ap.add_argument("--version", required=True)
     ap.add_argument("--emit", type=Path, default=DEFAULT_EMIT)
     ap.add_argument("--bd-url", default=None, help="BD SCA project link (default: config url)")
+    ap.add_argument("--override", action="append", default=[], metavar="COMPONENT=VERSION",
+                    help="monitor a component at a different release than BD scanned "
+                         "(e.g. --override curl=8.21.0); repeatable")
     ap.add_argument("--replace", action="store_true", help="re-ingest, replacing any existing rows")
     args = ap.parse_args()
 
     cfg = load_config()
     bd_url = args.bd_url or cfg.get("url", "")
+    overrides = dict(kv.split("=", 1) for kv in args.override) or None
 
     primaries, all_compiled = parse_emit(args.emit)
     print(f"[emit] {len(primaries)} primary TUs, {len(all_compiled)} compiled files", flush=True)
@@ -62,7 +66,8 @@ def main() -> None:
             s.delete(existing)
             s.flush()
 
-        proj = Project(name=args.project, bd_project_url=bd_url, bd_version=args.version)
+        proj = Project(name=args.project, bd_project_url=bd_url, bd_version=args.version,
+                       overrides=overrides)
         s.add(proj)
         s.flush()
 
