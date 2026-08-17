@@ -1121,12 +1121,12 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--port", type=int, default=8378)
     parser.add_argument("--data-dir", type=Path, action="append", dest="data_dirs",
-                        required=True,
-                        help="a project data dir (repeatable; one per BD SCA project)")
+                        help="a project data dir (repeatable; one per BD SCA project). "
+                             "Optional — projects can also be added live via POST /projects/add.")
     parser.add_argument("--triage-url", default=DEFAULT_TRIAGE_URL)
     args = parser.parse_args()
 
-    MonitorHandler.reg = Registry(args.data_dirs, args.triage_url)
+    MonitorHandler.reg = Registry(args.data_dirs or [], args.triage_url)
     print(f"[monitor] {len(MonitorHandler.reg.projects)} project(s):")
     for name, ps in MonitorHandler.reg.projects.items():
         print(f"[monitor]   {name}: {len(ps.watches)} repos, "

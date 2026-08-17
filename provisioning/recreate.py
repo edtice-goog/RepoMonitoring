@@ -15,6 +15,7 @@ Also importable: recreate_project(name, out_dir, ...) -> summary  (used by the U
 import argparse
 import hashlib
 import json
+import re
 import sys
 from pathlib import Path
 
@@ -32,6 +33,17 @@ from bd_scout import BDClient, load_config                            # noqa: E4
 from bd_provision import (build_anthropic_client, component_context,   # noqa: E402
                           enhance_with_claude, resolve_project_version)
 from gh_replay import GH, gh_token, fetch_commits, parse_owner_repo    # noqa: E402
+
+
+def _clean_tag(source_ref):
+    """Extract a clean release tag from a `.git` actual-source ref like
+    '68720b48 (curl-8_21_0)'. Returns None if HEAD wasn't exactly on a tag (a
+    describe like 'v1.3.1-1-g59933ec') — in that case fall back to the SCA version."""
+    m = re.search(r"\(([^)]+)\)", source_ref or "")
+    if not m:
+        return None
+    desc = m.group(1)
+    return None if re.search(r"-\d+-g[0-9a-f]+$", desc) else desc
 
 
 def recreate_project(name, out_dir, refresh_sbom=False, refresh_events=False,
@@ -129,14 +141,18 @@ def recreate_project(name, out_dir, refresh_sbom=False, refresh_events=False,
                               "version_source": "git-discovered", **prov}
 
     # ---------- (5) repo trees at the immutable file-scope ref (cached) ----------
+    # Prefer the EXACT tag we actually built (git provenance) over BD's component
+    # version string, which can be an unreliable KB label (e.g. curl "rc-8_21_0-2").
     filesets, warnings = {}, []
     for cand in candidates.values():
         owner, repo = parse_owner_repo(cand["vcs_url"])
         if not owner:
             continue
+        asrc = cand.get("actual_source")
+        pin = _clean_tag(asrc.get("ref")) if (asrc and not cand.get("divergent")) else None
 
-        def tree_producer(o=owner, r=repo, ver=cand.get("version")):
-            tag = resolve_tag(_gh(), o, r, ver)
+        def tree_producer(o=owner, r=repo, ver=cand.get("version"), pin=pin):
+            tag = pin or resolve_tag(_gh(), o, r, ver)
             ref = tag or _gh().get(f"/repos/{o}/{r}").get("default_branch", "master")
             try:
                 fs, _ = fetch_fileset(_gh(), o, r, ref)
@@ -144,7 +160,7 @@ def recreate_project(name, out_dir, refresh_sbom=False, refresh_events=False,
             except Exception as exc:   # stale ref, etc. — surface, don't abort
                 return {"ref": ref, "files": [], "error": str(exc)}
 
-        tree = cache.cached("tree", {"repo": f"{owner}/{repo}", "version": cand.get("version")},
+        tree = cache.cached("tree", {"repo": f"{owner}/{repo}", "ref": pin or cand.get("version")},
                             tree_producer)
         cand["file_scope_ref"] = tree["ref"]
         if tree.get("error"):
