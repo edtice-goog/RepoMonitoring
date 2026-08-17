@@ -54,7 +54,6 @@ def recreate_project(name, out_dir, refresh_sbom=False, refresh_events=False,
                        "actual_source_ref": p.actual_source_ref,
                        "divergent": p.divergent} for p in proj.provenance]
         bd_version = proj.bd_version
-        overrides = proj.overrides or {}
     log(f"[seed] {len(primaries)} primary TUs, {len(all_compiled)} compiled files, "
         f"{len(provenance)} provenance rows")
 
@@ -70,14 +69,6 @@ def recreate_project(name, out_dir, refresh_sbom=False, refresh_events=False,
         return component_context(comps)
     sbom = cache.cached("sbom", {"project": name, "version": bd_version},
                         sbom_producer, refresh=refresh_sbom)
-    # Per-component version override (demo re-point without re-scanning): monitor a
-    # different release than BD scanned. Applied before vcs/watch/tree so the pinned
-    # tag, watch branch, and file-scope ref all follow the override.
-    for c in sbom:
-        ov = overrides.get(slugify(c["componentName"]))
-        if ov:
-            log(f"[override] {c['componentName']} {c['componentVersionName']} -> {ov}")
-            c["componentVersionName"] = ov
     log(f"[sbom] {len(sbom)} components")
 
     # ---------- (2) vcs-enhance, per component (only new ones miss) ----------
@@ -264,6 +255,22 @@ def recreate_project(name, out_dir, refresh_sbom=False, refresh_events=False,
     return summary
 
 
+def register_with_monitor(monitor_url, project, out_dir):
+    """POST the recreated project to a running monitor so it loads it without a
+    restart. Non-fatal if the monitor isn't up."""
+    import urllib.parse
+    import urllib.request
+    url = (monitor_url.rstrip("/") + "/projects/add?"
+           + urllib.parse.urlencode({"project": project, "data_dir": str(Path(out_dir).resolve())}))
+    try:
+        with urllib.request.urlopen(urllib.request.Request(url, method="POST", data=b""),
+                                    timeout=30) as r:
+            print(f"[monitor] registered {project}: {r.read().decode()}", flush=True)
+    except Exception as exc:
+        print(f"[monitor] could not register with {monitor_url} ({exc}); "
+              f"start the monitor or load --data-dir {out_dir} manually", flush=True)
+
+
 def main() -> None:
     for stream in (sys.stdout, sys.stderr):
         try:
@@ -276,10 +283,15 @@ def main() -> None:
     ap.add_argument("--refresh-sbom", action="store_true")
     ap.add_argument("--refresh-events", action="store_true")
     ap.add_argument("--commits", type=int, default=6)
+    ap.add_argument("--monitor-url", default=None,
+                    help="if set, POST the recreated project to this monitor to load it "
+                         "live (e.g. http://127.0.0.1:8378)")
     args = ap.parse_args()
     summary = recreate_project(args.project, args.out_dir, refresh_sbom=args.refresh_sbom,
                                refresh_events=args.refresh_events, commits=args.commits)
     print(json.dumps(summary, indent=2))
+    if args.monitor_url:
+        register_with_monitor(args.monitor_url, args.project, args.out_dir)
 
 
 if __name__ == "__main__":

@@ -555,14 +555,27 @@ class Registry:
         loaded = {ps.project for ps in self.projects.values()}
         return [n for n in names if n not in loaded]
 
-    def run_add(self, project_name):
-        """Recreate a seeded project into its own data dir and register it live."""
+    def run_add(self, project_name, data_dir=None):
+        """Load an ALREADY-recreated project data dir into the running monitor. The
+        analysis script (ingest -> recreate) writes the data dir, then calls
+        POST /projects/add to register it live — no restart. If the project is already
+        loaded, reload it in place (idempotent re-analysis)."""
         try:
             import re
-            from provisioning.recreate import recreate_project
-            slug = re.sub(r"[^a-z0-9._-]+", "-", project_name.lower()).strip("-")
-            data_dir = REPO_ROOT / f"live-{slug}"
-            recreate_project(project_name, data_dir, refresh_sbom=True, log=lambda m: None)
+            if not data_dir:
+                slug = re.sub(r"[^a-z0-9._-]+", "-", project_name.lower()).strip("-")
+                data_dir = REPO_ROOT / f"live-{slug}"
+            data_dir = Path(data_dir)
+            if not (data_dir / "build-capture.json").exists():
+                raise FileNotFoundError(f"no recreated data at {data_dir}; run recreate first")
+            for nm, ps in list(self.projects.items()):
+                if ps.project == project_name:
+                    ps.data_dir = data_dir
+                    ps.reload()
+                    ps.replay_events()
+                    self.add_status = {"state": "done", "message": f"reloaded {nm}",
+                                       "error": None, "at": now_iso()}
+                    return
             name = self.add_project(data_dir)
             self.projects[name].replay_events()   # restore any cached events (0 tokens)
             self.add_status = {"state": "done", "message": f"added {name}", "error": None,
@@ -629,30 +642,6 @@ def render_project_list(reg: Registry) -> bytes:
             f"<td>{pill(s['alerts'], '#C0392B')}</td>"
             f"<td>{pill(s['needs_review'], '#B9770E')}</td>"
             f"<td class='muted'>{esc(s['last_activity'])}</td></tr>")
-    # Add-a-project: seeded in Postgres but not yet loaded — recreate + register live.
-    available = reg.db_projects_not_loaded()
-    ast = reg.add_status
-    add_rows = "".join(
-        f"<li style='margin:3px 0'><code>{esc(n)}</code> "
-        f"<button onclick=\"this.disabled=true;fetch('/projects/add?project={quote(n)}',"
-        f"{{method:'POST'}}).then(()=>setTimeout(()=>location.reload(),900))\" "
-        f"style='background:#582C83;color:#fff;border:0;border-radius:4px;padding:3px 9px;"
-        f"cursor:pointer;font-size:12px'>+ Add</button></li>" for n in available)
-    if ast["state"] == "running":
-        add_stat = f"<span style='color:#B9770E'>{esc(ast['message'])}&hellip;</span>"
-    elif ast["state"] == "done":
-        add_stat = f"<span style='color:#2E7D32'>{esc(ast['message'])}</span>"
-    elif ast["state"] == "error":
-        add_stat = f"<span style='color:#C0392B'>add error: {esc(ast['error'])}</span>"
-    else:
-        add_stat = ""
-    add_section = ""
-    if available or ast["state"] != "idle":
-        add_section = (
-            f"<h2>Add a project</h2><p class='muted'>Seeded in Postgres but not loaded — "
-            f"recreate + load into the running monitor, no restart. {add_stat}</p>"
-            f"<ul style='list-style:none;padding-left:0'>{add_rows or '<li class=muted>none pending</li>'}</ul>")
-
     body = f"""
 <h1>RepoMonitoring <span class="muted">— {len(reg.projects)} project(s)</span></h1>
 <p class="muted">Each project is one Black Duck SCA analysis. Select a project to see its
@@ -661,8 +650,7 @@ watched repositories and the upstream commit events being triaged. Triage backen
 <table>
 <tr><th>Project</th><th>Components</th><th>Monitored</th><th>Reference-only</th>
 <th>Events</th><th>Response&nbsp;req.</th><th>Needs&nbsp;review</th><th>Last activity</th></tr>
-{rows}</table>
-{add_section}"""
+{rows}</table>"""
     return _page("RepoMonitoring — projects", body)
 
 
@@ -1005,15 +993,14 @@ class MonitorHandler(BaseHTTPRequestHandler):
     def do_POST(self) -> None:
         parsed = urlparse(self.path)
 
-        # UI action: load a seeded (Postgres) project into the running monitor — no restart.
+        # API (called by the analysis script): register an already-recreated project's
+        # data dir into the running monitor — no restart. Reloads if already loaded.
         if parsed.path == "/projects/add":
             qs = parse_qs(parsed.query)
             project = unquote(qs["project"][0]) if "project" in qs else None
+            data_dir = unquote(qs["data_dir"][0]) if "data_dir" in qs else None
             if not project:
                 self._send_json(400, {"error": "missing project"})
-                return
-            if project in self.reg.projects:
-                self._send_json(409, {"error": "already loaded"})
                 return
             with self.reg.add_lock:
                 if self.reg.add_status["state"] == "running":
@@ -1021,7 +1008,7 @@ class MonitorHandler(BaseHTTPRequestHandler):
                     return
                 self.reg.add_status = {"state": "running", "message": f"adding {project}",
                                        "error": None, "at": now_iso()}
-            threading.Thread(target=self.reg.run_add, args=(project,), daemon=True).start()
+            threading.Thread(target=self.reg.run_add, args=(project, data_dir), daemon=True).start()
             self._send_json(202, {"status": "started", "project": project})
             return
 
