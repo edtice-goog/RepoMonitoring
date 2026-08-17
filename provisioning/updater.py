@@ -44,18 +44,22 @@ def _git(cwd, *args, check=True, timeout=600):
 
 # --------------------------------------------------------------- local clone cache
 def ensure_clone(url):
-    """A partial mirror clone (commits+trees, no blobs). First call clones; later
-    calls fetch. Returns the clone dir."""
+    """A partial mirror clone (commits+trees, no blobs). First call clones; later calls
+    fetch the latest from the remote. Returns (clone_dir, fetched_ok); fetched_ok is
+    False when the refresh fetch failed, so callers can warn the result may be stale
+    rather than silently trusting an out-of-date clone."""
     owner, repo = parse_owner_repo(url)
     dest = CLONES / owner / f"{repo}.git"
+    fetched = True
     if (dest / "HEAD").exists():
-        subprocess.run(["git", "-C", str(dest), "remote", "update", "--prune"],
-                       capture_output=True, text=True, timeout=600)
+        r = subprocess.run(["git", "-C", str(dest), "remote", "update", "--prune"],
+                           capture_output=True, text=True, timeout=600)
+        fetched = (r.returncode == 0)
     else:
         dest.parent.mkdir(parents=True, exist_ok=True)
         subprocess.run(["git", "clone", "--mirror", "--filter=blob:none", url, str(dest)],
                        capture_output=True, text=True, check=True, timeout=1800)
-    return dest
+    return dest, fetched
 
 
 def _resolve_tag(clone, version):
@@ -153,7 +157,9 @@ def count_pending(project_name, watches):
     per, total, warnings = [], 0, []
     for r in _repos(watches):
         try:
-            clone = ensure_clone(r["url"])
+            clone, fetched = ensure_clone(r["url"])
+            if not fetched:
+                warnings.append(f"{r['component']}: clone refresh failed; count may be stale")
             base, _ = _base_for(project_name, clone, r)
             if base is None:
                 warnings.append(f"{r['component']}: could not resolve base ref for {r['version']}")
@@ -176,7 +182,9 @@ def fetch_updates(project_name, watches, mode, limit=None):
     events, advances, processed, warnings = [], [], 0, []
     for r in _repos(watches):
         try:
-            clone = ensure_clone(r["url"])
+            clone, fetched = ensure_clone(r["url"])
+            if not fetched:
+                warnings.append(f"{r['component']}: clone refresh failed; may miss new commits")
             base, last_sha = _base_for(project_name, clone, r)
             if base is None:
                 warnings.append(f"{r['component']}: could not resolve base ref")
