@@ -47,11 +47,24 @@ def _clean_tag(source_ref):
 
 
 def recreate_project(name, out_dir, refresh_sbom=False, refresh_events=False,
-                     commits=6, log=print):
+                     commits=6, reset_feed=False, log=print):
     cache.reset_stats()
     cfg = load_config()
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
+
+    # Re-base cleanup: when the monitored release changes (e.g. curl 8.11 -> 8.21) the
+    # accumulated event feed + cursors are relative to the OLD tag and are now stale.
+    # --reset-feed clears them so the feed starts fresh at the new pinned release.
+    if reset_feed:
+        from db.models import EventCursor
+        (out_dir / f"{name}-commit-events.json").write_text(
+            json.dumps({"_comment": "Durable event feed (reset).", "events": []}, indent=2),
+            encoding="utf-8")
+        with SessionLocal() as s:
+            n = s.query(EventCursor).filter_by(project_name=name).delete()
+            s.commit()
+        log(f"[reset-feed] cleared events file + {n} cursor(s)")
 
     # ---------- seeds from Postgres ----------
     with SessionLocal() as s:
@@ -152,13 +165,13 @@ def recreate_project(name, out_dir, refresh_sbom=False, refresh_events=False,
         pin = _clean_tag(asrc.get("ref")) if (asrc and not cand.get("divergent")) else None
 
         def tree_producer(o=owner, r=repo, ver=cand.get("version"), pin=pin):
-            tag = pin or resolve_tag(_gh(), o, r, ver)
-            ref = tag or _gh().get(f"/repos/{o}/{r}").get("default_branch", "master")
             try:
+                tag = pin or resolve_tag(_gh(), o, r, ver)
+                ref = tag or _gh().get(f"/repos/{o}/{r}").get("default_branch", "master")
                 fs, _ = fetch_fileset(_gh(), o, r, ref)
                 return {"ref": ref, "files": sorted(fs)}
-            except Exception as exc:   # stale ref, etc. — surface, don't abort
-                return {"ref": ref, "files": [], "error": str(exc)}
+            except Exception as exc:   # stale ref, missing repo, etc. — surface, don't abort
+                return {"ref": None, "files": [], "error": str(exc)}
 
         tree = cache.cached("tree", {"repo": f"{owner}/{repo}", "ref": pin or cand.get("version")},
                             tree_producer)
@@ -299,12 +312,16 @@ def main() -> None:
     ap.add_argument("--refresh-sbom", action="store_true")
     ap.add_argument("--refresh-events", action="store_true")
     ap.add_argument("--commits", type=int, default=6)
+    ap.add_argument("--reset-feed", action="store_true",
+                    help="clear the durable event feed + cursors (use when RE-BASING a "
+                         "project to a new release, so the old gap's commits don't linger)")
     ap.add_argument("--monitor-url", default=None,
                     help="if set, POST the recreated project to this monitor to load it "
                          "live (e.g. http://127.0.0.1:8378)")
     args = ap.parse_args()
     summary = recreate_project(args.project, args.out_dir, refresh_sbom=args.refresh_sbom,
-                               refresh_events=args.refresh_events, commits=args.commits)
+                               refresh_events=args.refresh_events, commits=args.commits,
+                               reset_feed=args.reset_feed)
     print(json.dumps(summary, indent=2))
     if args.monitor_url:
         register_with_monitor(args.monitor_url, args.project, args.out_dir)
