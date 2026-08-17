@@ -12,7 +12,9 @@ on a **real** captured project (cURL 8.11 + zlib 1.3.1 from source, linking Open
 | `monitor/app.py` | Multi-project web dashboard + Git webhook endpoint + **Recreate** button |
 | `triage-service/claude_server.py` | LLM triage (Claude) with a persistent cache; `--cache-only` for keyless replay |
 | `driver/replay.py` | Fires saved upstream commits at the monitor as standard Git webhooks |
-| `provisioning/ingest.py` | **Once per release:** writes the can't-recreate seeds to Postgres |
+| `scripts/emit_local.py` | Stdlib-only local collection — the only piece that runs on the build box |
+| `provisioning/ingest.py` | **Once per release:** the build-box CLIENT — collects local seeds + POSTs them to the monitor |
+| `provisioning/ingest_service.py` | Server side of ingestion — enriches provenance (GitHub) + persists the seeds to Postgres |
 | `provisioning/recreate.py` | Rebuilds a project's dashboard artifacts from seeds + cache (0 external calls warm) |
 | `db/` + `alembic/` | Postgres schema (SQLAlchemy) — the 3 seed tables |
 | `services/cache.py` | Redis cache: every external result stored once, keyed by input |
@@ -38,7 +40,7 @@ miss that fetches exactly once.
    `url`, `api_token`, `anthropic_api_key`.
 4. A GitHub login for commit/tree pulls: `gh auth login` (or `GITHUB_TOKEN`).
 
-## One-time setup
+## One-time setup (monitor host)
 
 ```bash
 # 1. bring up the user-owned Postgres + Redis (ports 5544 / 6380, persistent AOF)
@@ -47,14 +49,39 @@ wsl -d Ubuntu -- bash infra/stack.sh up
 # 2. create the schema
 python -m alembic upgrade head
 
-# 3. seed the can't-recreate tables from the real capture (needs the checkouts + idir)
-python provisioning/ingest.py --project repo-mon-stage3-curl --version 8.11.0
+# 3. start the services (datastores + triage + monitor). The monitor starts even with
+#    no projects; ingested projects reload automatically on every restart.
+./infra/serve.ps1 up
 ```
 
-After step 3 the local build (`stage3/`, the Coverity idir) can be deleted — everything
-else is recreatable from the seeds + cache.
+## Ingest a release (remote build box → monitor)
 
-## Recreate the dashboard artifacts
+Production builds run on a **remote** box (Linux/macOS/Windows), not the monitor host, so
+ingestion is a client → API → DB flow — no shared filesystem. Right after a release build,
+on the build box (needs only Python + `git` — no DB, no GitHub token, none of the monitor's
+deps):
+
+```bash
+python provisioning/ingest.py --project repo-mon-stage3-curl --version 8.21.0 \
+    --monitor-url http://<monitor-host>:8378 --replace
+```
+
+The client reads the two purely-local artifacts — the Coverity compiled-file set
+(`cov_emit_links.json`) and each `.git` checkout's origin + exact ref — and POSTs them.
+The server enriches provenance (checkout → canonical upstream, a GitHub fork-parent
+lookup), **persists the seeds to Postgres**, then recreates the dashboard artifacts and
+loads the project live. The BD **SBoM is never sent** — it's reloaded from the BD project
+link and cached. After ingest the build box (`stage3/`, the Coverity idir) can be deleted:
+everything the monitor needs is now in Postgres + the cache.
+
+- `--reset-feed` when RE-BASING a project to a new release (clears the old release's event
+  feed + cursors); `--replace` overwrites an existing project.
+- `--direct-db` is a co-located DEV shortcut that skips the API and writes Postgres from
+  the client (needs the server deps + a GitHub token).
+
+## Recreate the dashboard artifacts (server-side, advanced)
+
+Ingestion already recreates + loads. To rebuild a project's artifacts on their own:
 
 ```bash
 python provisioning/recreate.py --project repo-mon-stage3-curl --out-dir live-stage3
@@ -63,7 +90,8 @@ python provisioning/recreate.py --project repo-mon-stage3-curl --out-dir live-st
 - **Cold cache:** makes the BD/Claude/GitHub calls once, populating Redis.
 - **Warm cache:** `external_calls: 0` — identical output, no network.
 - `--refresh-sbom` re-pulls the BD SBoM to pick up KB growth (new components miss + fetch
-  once); `--refresh-events` re-pulls commits on the watch branches.
+  once); `--refresh-events` re-pulls commits on the watch branches; `--reset-feed` clears
+  the durable feed + cursors on a re-base.
 
 ## Run the demo
 
@@ -90,13 +118,15 @@ python driver/replay.py --events live-stage3/repo-mon-stage3-curl-commit-events.
 ```bash
 wsl -d Ubuntu -- bash infra/stack.sh up           # datastores
 python triage-service/claude_server.py            # or --cache-only for keyless replay
-python monitor/app.py --data-dir live-stage3
+python monitor/app.py                              # reloads every ingested project (see below)
 python driver/replay.py --events live-stage3/repo-mon-stage3-curl-commit-events.json --all
 ```
 
 Open **http://127.0.0.1:8378/** — the project list. Click a project to drill in.
 
-Load several projects with repeated `--data-dir`. A push to a shared upstream (zlib,
+On startup the monitor **reloads every project seeded in Postgres** that has recreated
+data on disk (remembered per-project in `.monitor-loaded.json`), so runtime-ingested
+projects survive a restart with no `--data-dir` needed. A push to a shared upstream (zlib,
 OpenSSL) routes to every project that watches it.
 
 ### What the dashboard shows
