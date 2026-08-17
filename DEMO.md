@@ -120,6 +120,21 @@ On a project page, **🔄 Recreate** refreshes the BoM from Black Duck and re-ru
 cache-backed pipeline in the background (status shown inline). Unchanged BoM ⇒ one BD
 call, no Claude/GitHub. Grown BoM ⇒ the new component fetches once. No terminal needed.
 
+### The Check-for-updates button
+
+Webhooks handle commits that land *after* setup. **↻ Check for updates** handles the
+gap between the built release and now (and is the manual fallback when a repo has no
+webhook). It counts new commits on each watch branch since the last-seen cursor (or,
+first time, the built tag), and — because that gap can be thousands of commits — **warns
+before processing** if the total exceeds 100: *Process all N* / *Only latest 100* /
+*Cancel*. Each processed commit runs through the same relevance→triage path as a webhook
+and advances the per-repo cursor (Postgres), so re-checking only pulls what's newer.
+
+To avoid hammering the VCS, the backfill reads from a **local partial-mirror clone**
+(`git clone --mirror --filter=blob:none`, kept under `clones/`) via `git log
+--name-status` — one clone + incremental `git fetch`, no per-commit API calls. (curl
+`master` alone is ~6k commits since a release; that's one clone, not 6k requests.)
+
 ## Triage backends
 
 `claude_server.py` calls Claude for a real verdict and **caches input→output** (keyed by

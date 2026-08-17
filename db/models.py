@@ -16,7 +16,7 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 
-from sqlalchemy import Boolean, DateTime, ForeignKey, String, Text
+from sqlalchemy import Boolean, DateTime, ForeignKey, String, Text, UniqueConstraint
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
 
@@ -82,3 +82,24 @@ class SourceProvenance(Base):
     divergent: Mapped[bool] = mapped_column(Boolean, default=False)
 
     project: Mapped["Project"] = relationship(back_populates="provenance")
+
+
+class EventCursor(Base):
+    """Per (project, repo) high-water mark for the 'check for updates' backfill.
+
+    Operational state (not a seed): the newest upstream commit we've already
+    surfaced as an event. On the first check for a repo it is absent, so the
+    backfill starts at the built release tag's date and replays forward to now;
+    thereafter it only pulls what is newer. This is what lets a manual refresh
+    stand in when a repo has no webhook.
+    """
+    __tablename__ = "event_cursor"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    project_name: Mapped[str] = mapped_column(String(200), index=True)
+    repo_url: Mapped[str] = mapped_column(String(500))        # normalized VCS url
+    last_seen_at: Mapped[str | None] = mapped_column(String(40), nullable=True)   # ISO8601
+    last_seen_sha: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
+
+    __table_args__ = (UniqueConstraint("project_name", "repo_url", name="uq_cursor_project_repo"),)

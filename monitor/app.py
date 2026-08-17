@@ -77,6 +77,9 @@ class ProjectState:
         self.build_id = "?"
         self.recreate_status = {"state": "idle", "summary": None, "error": None, "at": None}
         self.recreate_lock = threading.Lock()
+        self.update_status = {"state": "idle", "preview": None, "summary": None,
+                              "error": None, "at": None}
+        self.update_lock = threading.Lock()
         self._load()
 
     def reload(self) -> None:
@@ -353,6 +356,41 @@ class ProjectState:
             self.recreate_status = {"state": "error", "summary": None,
                                     "error": repr(exc), "at": now_iso()}
 
+    # ----------------------------------------------------------- check for updates
+    def run_update(self, mode=None, limit=None) -> None:
+        """Backfill/poll upstream commits since the last-seen cursor (or the built
+        tag date) and fire them through the webhook path. mode=None counts first and
+        either auto-processes (<= threshold) or parks in 'preview' for the user to
+        choose; mode 'all'/'latest' processes the chosen set."""
+        try:
+            from provisioning import updater
+            if mode is None:
+                plan = updater.count_pending(self.project, self.watches)
+                if plan["total"] == 0:
+                    self.update_status = {"state": "done", "preview": None, "error": None,
+                                          "at": now_iso(),
+                                          "summary": {"processed": 0, "message": "up to date"}}
+                elif plan["total"] <= plan["threshold"]:
+                    self._apply_update("all", None)
+                else:
+                    self.update_status = {"state": "preview", "preview": plan, "summary": None,
+                                          "error": None, "at": now_iso()}
+            else:
+                self._apply_update(mode, limit)
+        except Exception as exc:
+            self.update_status = {"state": "error", "preview": None, "summary": None,
+                                  "error": repr(exc), "at": now_iso()}
+
+    def _apply_update(self, mode, limit) -> None:
+        from provisioning import updater
+        res = updater.fetch_updates(self.project, self.watches, mode, limit)
+        for payload in res["payloads"]:
+            self.process_push(payload)
+        updater.commit_advances(self.project, res["advances"])
+        self.update_status = {"state": "done", "preview": None, "error": None, "at": now_iso(),
+                              "summary": {"processed": res["processed"],
+                                          "fired": len(res["payloads"]), "mode": mode}}
+
     # ----------------------------------------------------------- summary
     def summary(self) -> dict:
         comps = {w["component"] for w in self.watches}
@@ -580,10 +618,43 @@ def render_project(reg: Registry, ps: ProjectState) -> bytes:
         f"style='background:#582C83;color:#fff;border:0;border-radius:4px;padding:6px 12px;"
         f"cursor:pointer;font-size:13px'>&#x1F504; Recreate</button> <span style='font-size:12px'>{st}</span>")
 
+    # Check-for-updates: count new upstream commits since the cursor (or tag date),
+    # warn over threshold, then backfill through the webhook path.
+    def _ubtn(label, q, bg):
+        return (f"<button onclick=\"this.disabled=true;fetch('/update?project={quote(ps.name)}{q}',"
+                f"{{method:'POST'}}).then(()=>setTimeout(()=>location.reload(),500))\" "
+                f"style='background:{bg};color:#fff;border:0;border-radius:4px;padding:5px 10px;"
+                f"cursor:pointer;font-size:12px;margin-right:4px'>{label}</button>")
+    us = ps.update_status
+    check_btn = _ubtn("&#x21bb; Check for updates", "", "#1F6F78")
+    if us["state"] in ("counting", "running"):
+        act = "checking for new upstream commits" if us["state"] == "counting" else "processing updates"
+        ust = f"<span style='color:#B9770E'>{act}&hellip;</span>"
+    elif us["state"] == "preview":
+        p = us["preview"] or {}
+        per = ", ".join(f"{esc(x['component'])}:{x['pending']}"
+                        for x in p.get("repos", []) if x.get("pending"))
+        thr = p.get("threshold", 100)
+        ust = (f"<div style='margin-top:6px;color:#C0392B'><b>{p.get('total')} new commits</b> pending "
+               f"since the built release ({esc(per)}). "
+               + _ubtn(f"Process all {p.get('total')}", "&amp;mode=all", "#C0392B")
+               + _ubtn(f"Only latest {thr}", f"&amp;mode=latest&amp;limit={thr}", "#B9770E")
+               + _ubtn("Cancel", "&amp;mode=cancel", "#7F8C8D") + "</div>")
+    elif us["state"] == "done":
+        s = us["summary"] or {}
+        msg = s.get("message") or f"processed {s.get('processed', 0)} new commit(s)"
+        ust = f"<span style='color:#2E7D32'>{esc(msg)}</span>"
+    elif us["state"] == "error":
+        ust = f"<span style='color:#C0392B'>update error: {esc(us['error'])}</span>"
+    else:
+        ust = "<span class='muted'>webhooks handle new commits; click to backfill / poll manually</span>"
+    update_html = f"{check_btn} <span style='font-size:12px'>{ust}</span>"
+
     body = f"""
 <p><a href="/">&larr; Projects</a></p>
 <h1>{esc(ps.name)} <span class="muted">({esc(ps.build_id)})</span></h1>
 <p>{recreate_html}</p>
+<p>{update_html}</p>
 <p class="muted" style="font-size:13px"><b>Precision funnel:</b> {funnel}</p>
 <h2>Monitored repos ({len(mon)})</h2>
 <table><tr><th>Component</th><th>VCS URL</th><th>Relationship</th><th>Provenance</th><th>Pinned ref</th><th>Watches (branch)</th></tr>
@@ -658,6 +729,33 @@ class MonitorHandler(BaseHTTPRequestHandler):
             threading.Thread(target=ps.run_recreate, kwargs={"refresh_sbom": True},
                              daemon=True).start()
             self._send_json(202, {"status": "started", "project": project})
+            return
+
+        # UI action: check for / backfill new upstream commits since the cursor.
+        if parsed.path == "/update":
+            qs = parse_qs(parsed.query)
+            project = unquote(qs["project"][0]) if "project" in qs else None
+            ps = self.reg.projects.get(project)
+            if ps is None:
+                self._send_json(404, {"error": f"unknown project {project}"})
+                return
+            mode = qs.get("mode", [None])[0]
+            limit = int(qs["limit"][0]) if "limit" in qs else None
+            if mode == "cancel":
+                ps.update_status = {"state": "idle", "preview": None, "summary": None,
+                                    "error": None, "at": now_iso()}
+                self._send_json(200, {"status": "cancelled"})
+                return
+            with ps.update_lock:
+                if ps.update_status["state"] in ("counting", "running"):
+                    self._send_json(409, {"status": "busy"})
+                    return
+                ps.update_status = {"state": ("counting" if mode is None else "running"),
+                                    "preview": ps.update_status.get("preview"), "summary": None,
+                                    "error": None, "at": now_iso()}
+            threading.Thread(target=ps.run_update, kwargs={"mode": mode, "limit": limit},
+                             daemon=True).start()
+            self._send_json(202, {"status": "started", "mode": mode})
             return
 
         if parsed.path != "/webhook":

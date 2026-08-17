@@ -18,5 +18,8 @@ live*/
 # Service logs + pidfiles from infra/serve.ps1
 logs/
 
+# Local partial-mirror clones used by the 'check for updates' backfill
+clones/
+
 __pycache__/
 *.pyc
