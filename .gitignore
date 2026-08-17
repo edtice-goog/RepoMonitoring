@@ -15,6 +15,9 @@ blackduck.local.json
 live*/
 .venv/
 
+# Monitor-local: which data dir each project was last loaded from (absolute paths).
+.monitor-loaded.json
+
 # Service logs + pidfiles from infra/serve.ps1
 logs/
 

@@ -39,6 +39,10 @@ from urllib.parse import parse_qs, quote, unquote, urlparse
 REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT))  # repo root (for provisioning.* / db.*)
 
+# Monitor-local operational state: project -> the exact data dir it was last loaded from,
+# so a restart reloads the same dirs (a project can have several stale live-* dirs on disk).
+LOADED_MANIFEST = REPO_ROOT / ".monitor-loaded.json"
+
 DEFAULT_TRIAGE_URL = "http://127.0.0.1:8377/triage"
 
 
@@ -537,7 +541,20 @@ class Registry:
         self.add_status = {"state": "idle", "message": None, "error": None, "at": None}
         self.add_lock = threading.Lock()
         for d in data_dirs:
-            self._register(ProjectState(Path(d), triage_url))
+            ps = ProjectState(Path(d), triage_url)
+            self._register(ps)
+            self._remember(ps)
+
+    def _remember(self, ps: "ProjectState") -> None:
+        """Persist project -> data_dir so the next restart reloads the exact dir in use
+        (best-effort; a corrupt/missing manifest just falls back to the live-* scan)."""
+        try:
+            m = json.loads(LOADED_MANIFEST.read_text(encoding="utf-8")) \
+                if LOADED_MANIFEST.exists() else {}
+            m[ps.project] = str(ps.data_dir.resolve())
+            LOADED_MANIFEST.write_text(json.dumps(m, indent=2), encoding="utf-8")
+        except Exception:
+            pass
 
     def _register(self, ps: "ProjectState") -> str:
         name, base, i = ps.project, ps.project, 2
@@ -564,6 +581,63 @@ class Registry:
         loaded = {ps.project for ps in self.projects.values()}
         return [n for n in names if n not in loaded]
 
+    def autoload_db_projects(self, log=print):
+        """Startup: reload every DB-seeded project that has recreated data on disk, so
+        projects added at runtime (POST /projects/add) survive a monitor restart.
+
+        The data-dir name isn't derivable from the project name (e.g. curl lives in
+        live-stage3, not live-repo-mon-stage3-curl), so we scan REPO_ROOT/live-* for a
+        build-capture.json and load a dir only if its project is currently seeded in
+        Postgres and not already loaded from an explicit --data-dir. Truncating the DB
+        therefore gives a clean slate on the next restart; the on-disk artifacts linger
+        harmlessly until their project is re-ingested."""
+        try:
+            from db.session import SessionLocal
+            from db.models import Project
+            with SessionLocal() as s:
+                db_names = {p.name for p in s.query(Project).all()}
+        except Exception as exc:
+            log(f"[autoload] DB unavailable ({exc!r}); loading only explicit --data-dirs")
+            return
+        loaded_dirs = {ps.data_dir.resolve() for ps in self.projects.values()}
+
+        def _try_load(d, why):
+            d = Path(d)
+            if d.resolve() in loaded_dirs or not (d / "build-capture.json").exists():
+                return
+            try:
+                ps = ProjectState(d, self.triage_url)
+            except Exception as exc:
+                log(f"[autoload] skip {d.name}: {exc!r}")
+                return
+            if ps.project not in db_names:
+                log(f"[autoload] skip {d.name}: project {ps.project!r} not seeded in DB")
+                return
+            if ps.project in {p.project for p in self.projects.values()}:
+                return                                     # same project under another dir
+            nm = self._register(ps)
+            self._remember(ps)
+            loaded_dirs.add(d.resolve())
+            # Restore the cached feed (0 tokens) OFF the startup path: replay makes triage
+            # HTTP calls, so a slow/not-yet-up triage service must not stall the monitor.
+            threading.Thread(target=ps.run_replay, daemon=True).start()
+            log(f"[autoload] loaded {nm} <- {d.name} ({why}; replaying feed in background)")
+
+        # 1) exact dirs remembered from the last run — authoritative, no ambiguity.
+        try:
+            manifest = json.loads(LOADED_MANIFEST.read_text(encoding="utf-8")) \
+                if LOADED_MANIFEST.exists() else {}
+        except Exception:
+            manifest = {}
+        for proj, d in manifest.items():
+            if proj in db_names:
+                _try_load(d, "remembered")
+
+        # 2) fallback: any DB project still not loaded -> scan live-* for its data dir.
+        if set(db_names) - {p.project for p in self.projects.values()}:
+            for cap in sorted(REPO_ROOT.glob("live-*/build-capture.json")):
+                _try_load(cap.parent, "scan")
+
     def run_add(self, project_name, data_dir=None):
         """Load an ALREADY-recreated project data dir into the running monitor. The
         analysis script (ingest -> recreate) writes the data dir, then calls
@@ -582,10 +656,12 @@ class Registry:
                     ps.data_dir = data_dir
                     ps.reload()
                     ps.replay_events()
+                    self._remember(ps)            # remember the (possibly new) dir
                     self.add_status = {"state": "done", "message": f"reloaded {nm}",
                                        "error": None, "at": now_iso()}
                     return
             name = self.add_project(data_dir)
+            self._remember(self.projects[name])   # survive a restart
             self.projects[name].replay_events()   # restore any cached events (0 tokens)
             self.add_status = {"state": "done", "message": f"added {name}", "error": None,
                                "at": now_iso()}
@@ -1165,6 +1241,7 @@ def main() -> None:
     args = parser.parse_args()
 
     MonitorHandler.reg = Registry(args.data_dirs or [], args.triage_url)
+    MonitorHandler.reg.autoload_db_projects()   # reload runtime-added projects after restart
     print(f"[monitor] {len(MonitorHandler.reg.projects)} project(s):")
     for name, ps in MonitorHandler.reg.projects.items():
         print(f"[monitor]   {name}: {len(ps.watches)} repos, "
