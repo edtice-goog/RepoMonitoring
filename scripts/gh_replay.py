@@ -211,7 +211,15 @@ def main() -> None:
         print(f"[{owner}/{repo}] {name} {version}", flush=True)
         try:
             tag = resolve_tag(gh, owner, repo, version)
-            branch, why = resolve_watch_branch(gh, owner, repo, version, item.get("vcsBranch") or "")
+            # Prefer the Claude-resolved watch branch recorded in the manifest
+            # (attribute_capture's watchRef); fall back to the local heuristic only
+            # when a manifest was produced without it.
+            wr = item.get("watchRef")
+            if wr:
+                branch = wr
+                why = f"manifest watchRef [{item.get('releaseStyle','?')}/{item.get('watchConfidence','?')}]"
+            else:
+                branch, why = resolve_watch_branch(gh, owner, repo, version, item.get("vcsBranch") or "")
             print(f"    tag={tag or '(unresolved)'}  watch-branch={branch}  ({why})", flush=True)
 
             events = fetch_commits(gh, owner, repo, branch, args.commits, slug)

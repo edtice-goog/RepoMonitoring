@@ -75,6 +75,13 @@ Set `urgency` (critical/high/medium/low) only when response_required, else null.
 `vulnerability_class` and `reachability_notes` are descriptive and optional. \
 `recommended_action` is always set.
 
+CROSS-REPO PROPAGATION: if the input includes `mirrored_in` (the same physical \
+file is compiled into other repos too — e.g. an inline-vendored copy), then when \
+the verdict is security-relevant your `recommended_action` MUST say to propagate \
+the fix to those copies, and set `cross_repo_advice` explaining that a fix present \
+in one location but not its mirrors means one copy is behind. If not security- \
+relevant, leave `cross_repo_advice` null.
+
 SCOPE GUARD: classify and explain urgency ONLY. Never produce exploitation \
 guidance, proof-of-concept steps, or any instruction that would help trigger the \
 issue. Mirror the neutral language of public CVE/advisory notes."""
@@ -107,10 +114,15 @@ def gh_token() -> Optional[str]:
 
 
 def request_key(req: dict) -> str:
+    # Include the cross-repo mirror set: a mirrored-file request yields a
+    # patch-propagation verdict that a non-mirrored request must not collide with.
+    cross = sorted((c.get("component"), c.get("path"))
+                   for c in (req.get("cross_repo") or []))
     canon = json.dumps({
         "vcs_url": req.get("vcs_url"),
         "commit": req.get("commit"),
         "files": sorted(req.get("files", [])),
+        "cross_repo": cross,
     }, sort_keys=True)
     return hashlib.sha256(canon.encode()).hexdigest()
 
@@ -151,7 +163,7 @@ def fetch_commit_context(vcs_url: str, commit: str, in_scope: list, token: str):
 
 
 # --------------------------------------------------------------- Claude
-def triage_with_claude(anthropic_client, vcs_url, commit, in_scope, context):
+def triage_with_claude(anthropic_client, vcs_url, commit, in_scope, context, cross_repo=None):
     from pydantic import BaseModel
 
     class TriageResult(BaseModel):
@@ -161,6 +173,7 @@ def triage_with_claude(anthropic_client, vcs_url, commit, in_scope, context):
         urgency: Optional[Literal["critical", "high", "medium", "low"]] = None
         vulnerability_class: Optional[str] = None
         reachability_notes: Optional[str] = None
+        cross_repo_advice: Optional[str] = None
 
     owner, repo = owner_repo(vcs_url)
     component = (repo or vcs_url).lower()
@@ -171,6 +184,7 @@ def triage_with_claude(anthropic_client, vcs_url, commit, in_scope, context):
         "commit_message": context.get("message"),
         "in_scope_files": in_scope,
         "diffs": context.get("files", []),
+        "mirrored_in": cross_repo or [],
     }
     resp = anthropic_client.messages.parse(
         model=MODEL,
@@ -187,6 +201,7 @@ def triage_with_claude(anthropic_client, vcs_url, commit, in_scope, context):
         "reachability_notes": r.reachability_notes,
         "rationale": r.rationale,
         "recommended_action": r.recommended_action,
+        "cross_repo_advice": r.cross_repo_advice,
     }, {"input_tokens": resp.usage.input_tokens, "output_tokens": resp.usage.output_tokens}
 
 
@@ -244,6 +259,7 @@ class ClaudeTriageHandler(BaseHTTPRequestHandler):
             return
 
         vcs_url, files = req.get("vcs_url"), req.get("files", [])
+        cross = req.get("cross_repo") or []
         key = request_key(req)
         cache_file = self.cache_dir / f"{key}.json"
 
@@ -252,7 +268,7 @@ class ClaudeTriageHandler(BaseHTTPRequestHandler):
             entry = json.loads(cache_file.read_text(encoding="utf-8"))
             print(f"[triage-claude] CACHE HIT  {commit[:12]}  verdict={entry['result']['verdict']}")
             self._send_json(200, {"commit": commit, "vcs_url": vcs_url,
-                                  "files_evaluated": files,
+                                  "files_evaluated": files, "cross_repo_locations": cross,
                                   **entry["result"], "_triage_source": "claude-cache"})
             return
 
@@ -266,7 +282,8 @@ class ClaudeTriageHandler(BaseHTTPRequestHandler):
 
         try:
             context, source = fetch_commit_context(vcs_url, commit, files, self.gh_token_val)
-            result, usage = triage_with_claude(self.anthropic_client, vcs_url, commit, files, context)
+            result, usage = triage_with_claude(self.anthropic_client, vcs_url, commit,
+                                               files, context, cross)
         except Exception as exc:  # keep the demo alive on any live-path error
             print(f"[triage-claude] live triage error for {commit[:12]}: {exc}")
             self._send_json(200, {"commit": commit, "vcs_url": vcs_url,
@@ -289,7 +306,7 @@ class ClaudeTriageHandler(BaseHTTPRequestHandler):
         print(f"[triage-claude] LIVE  {commit[:12]}  verdict={result['verdict']}  "
               f"src={source}  tok={usage['input_tokens']}/{usage['output_tokens']}  -> cached")
         self._send_json(200, {"commit": commit, "vcs_url": vcs_url,
-                              "files_evaluated": files,
+                              "files_evaluated": files, "cross_repo_locations": cross,
                               **result, "_triage_source": "claude-live"})
 
     def log_message(self, fmt, *args):

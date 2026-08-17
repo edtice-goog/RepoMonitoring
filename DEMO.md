@@ -137,11 +137,25 @@ source, linking a prebuilt OpenSSL 3.6.3**:
   are tidily arranged by component** (if they were, you wouldn't need SCA). It
   takes the union of the **Black Duck BoM** and a **Claude reconstruction from the
   compiled file paths** (`cov_emit_links.json`), enumerates each candidate repo's
-  file tree, and attributes every compiled file to a repo via the mapping service
-  (`scripts/repo_mapper.py`, longest-suffix). A repo is **monitored iff it owns ≥1
-  *primary* translation unit** — OpenSSL, whose headers were `#included` but whose
-  `.c` were never compiled, owns none → reference-only. Build tools (CMake) are
-  excluded. Run it:
+  file tree, and attributes every compiled file to repos via the mapping service
+  (`scripts/repo_mapper.py`). A repo is **monitored iff it owns ≥1 *primary*
+  translation unit** — OpenSSL, whose headers were `#included` but whose `.c` were
+  never compiled, owns none → reference-only. Build tools (CMake) are excluded.
+  Three refinements make the watch model exact:
+  - **Multi-attribution.** `repo_mapper` maps each file to a *list* of repos, not
+    one. A file both built directly and inline-vendored (e.g. `third_party/zlib/…`)
+    belongs to the host *and* to upstream zlib — both are watched. A directory-level
+    *vendored-cluster* test licenses the low-confidence upstream match so a whole
+    vendored subtree fans out while a lone shared basename does not.
+  - **Provenance triple.** Per repo we record the **actual source** (the exact
+    `.git` checkout + ref we built, may be a fork), the **ground truth** (its
+    fork-parent / upstream canonical — what we watch), and the **fallback** (the SCA
+    identity). All three, cross-checking.
+  - **Watch ref via Claude.** The immutable pinned tag is *not* what we watch (it
+    never moves). A Claude call picks the moving branch where post-release fixes
+    land per project convention — curl→`master`, zlib→`develop`, OpenSSL→
+    `openssl-3.6` (the per-minor stable branch a name heuristic would miss) — with
+    a confidence flag. Run it:
 
 ```
 python scripts/attribute_capture.py     # BD BoM ∪ Claude-from-files → mapped index + union manifest
@@ -164,16 +178,21 @@ via **`.git` discovery**: each compiled file's enclosing checkout and `origin`
 remote are read (ground-truth attribution — no path guessing), and a fork is
 resolved to its canonical via the GitHub **fork-parent**. We then **monitor the
 canonical**, and record the local checkout as **divergent provenance** shown as
-`↳ built from <fork> ⚠ divergent` under the repo. Demonstrated by forking
+`↳ actual source <fork>@<ref> ⚠ divergent` under the repo. Demonstrated by forking
 `madler/zlib` → `edtice-goog/zlib`, editing `compress.c`, and rebuilding: zlib is
-monitored on `madler/zlib` with the fork flagged, curl on `curl/curl` (no
+monitored on `madler/zlib` with the fork flagged (actual source
+`edtice-goog/zlib@59933eca…`, one commit past `v1.3.1`), curl on `curl/curl` (no
 divergence), OpenSSL reference-only.
 
-> **Still open (next):** a copy vendored *inside another repo* with no `.git` of
-> its own (e.g. CMake's bundled `cmzlib`) can't be split by `.git`; it currently
-> relies on the build-tool exclusion + longest-suffix, and the `Attribution.ambiguous`
-> flag marks genuine same-path collisions. Full disambiguation lives in
-> `repo_mapper.py`.
+**Copies vendored *inside* another repo** (no `.git` of their own — e.g.
+`third_party/zlib/…`) are handled by multi-attribution rather than `.git`: the file
+maps to both the host and upstream zlib, so both are watched. And when a fix lands
+in one, the triage output carries a **cross-repo "patch everywhere" note** — the
+same physical file is compiled into the other repo (linked by a shared `origin`
+key), and a fix present in one location but not its mirror means one copy is behind.
+The stub emits a deterministic note; the live Claude triage reasons about
+propagation. (Shown by the synthetic `demo-vendored-curl` fixture; the real curl
+build has no inline vendoring, so its cards carry no note.)
 
 ### Prerequisites for live mode
 

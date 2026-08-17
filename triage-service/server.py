@@ -61,12 +61,26 @@ class TriageHandler(BaseHTTPRequestHandler):
             return
 
         result = self.verdicts.get(commit) or self.verdicts["_failsafe_default"]
-        self._send_json(200, {
+        response = {
             "commit": commit,
             "vcs_url": request.get("vcs_url"),
             "files_evaluated": request.get("files", []),
             **result,
-        })
+        }
+        # Cross-repo mirrors: the monitor found the same physical file compiled
+        # into other repos. A security fix here likely needs propagating — the
+        # mirrored copy is probably behind. (Deterministic note; verdict unchanged.)
+        cross = request.get("cross_repo") or []
+        if cross:
+            names = ", ".join(f"{c.get('component')} ({c.get('path')})"
+                              + (" [divergent]" if c.get("divergent") else "") for c in cross)
+            response["cross_repo_locations"] = cross
+            response["cross_repo_advice"] = (
+                f"Same file is also compiled into: {names}. If security-relevant, "
+                f"propagate the fix; the mirrored copy is likely behind upstream.")
+            if response.get("recommended_action"):
+                response["recommended_action"] += f" Also patch mirrored copies: {names}."
+        self._send_json(200, response)
 
     def log_message(self, fmt, *args):  # one-line request log, no noise
         print(f"[triage-stub] {self.address_string()} {fmt % args}")

@@ -66,7 +66,9 @@ class ProjectState:
         self.name = "?"            # registry key (defaults to project)
         self.watches = []          # watch manifest entries
         self.watch_by_url = {}     # norm_url -> watch entry
-        self.file_index = {}       # component -> [{rel, kind}]
+        self.watch_by_component = {}   # component -> watch entry
+        self.file_index = {}       # component -> [{rel, kind, origin}]
+        self.origin_index = {}     # origin -> [{component, rel}] (same physical file, N repos)
         self.results = []          # processed commit results, newest first
         self.project = "?"
         self.build_id = "?"
@@ -87,6 +89,18 @@ class ProjectState:
                     provenance=f"capture:{v.get('found_in', '?')}",
                     pinned_ref=repo.get("pinned_ref"),
                 )
+                # The moving WATCH ref (branch) is distinct from the immutable
+                # pinned_ref (the file-scope snapshot); carry it + provenance so
+                # the manifest can show what we actually monitor.
+                w = self.watch_by_url.get(norm_url(v["url"]))
+                if w is not None:
+                    for k in ("watch_ref", "watch_confidence", "release_style",
+                              "actual_source_ref"):
+                        if repo.get(k) is not None:
+                            w[k] = repo[k]
+                    if repo.get("built_from"):
+                        w["built_from"] = repo["built_from"]
+                        w["divergent"] = repo.get("divergent", False)
 
         # ... augmented with KB-served VCS URLs from the SCA side.
         hub_path = self.data_dir / "hub-api-components.json"
@@ -125,8 +139,15 @@ class ProjectState:
                 if f["path"].startswith(local_path + "/"):
                     rel = f["path"][len(local_path) + 1:]
                     break
-            entry = {"rel": rel, "path": f["path"], "kind": f["kind"]}
+            entry = {"rel": rel, "path": f["path"], "kind": f["kind"],
+                     "origin": f.get("origin")}
             self.file_index.setdefault(comp, []).append(entry)
+            # Mirror index: a single physical compiled file attributed to several
+            # repos (host + vendored upstream) shares one `origin`. This links the
+            # copies so a fix in one repo can flag the others for patching (Part 2).
+            if entry["origin"] and rel is not None:
+                self.origin_index.setdefault(entry["origin"], []).append(
+                    {"component": comp, "rel": rel})
 
         # Build-observed classification (determined once, here): a watched
         # component is MONITORED iff its source was actually compiled — i.e. it
@@ -136,6 +157,7 @@ class ProjectState:
         # SBOM (recall) x compiled-set (precision) intersection at repo scope.
         for w in self.watches:
             w["monitored"] = len(self.file_index.get(w["component"], [])) > 0
+            self.watch_by_component.setdefault(w["component"], w)
 
     def _add_watch(self, url, component, relationship, provenance, pinned_ref):
         key = norm_url(url)
@@ -169,7 +191,8 @@ class ProjectState:
             if rel is None:
                 continue
             if rel == changed:
-                return {"path": changed, "tier": 1, "confidence": 1.0, "matched": rel}
+                return {"path": changed, "tier": 1, "confidence": 1.0, "matched": rel,
+                        "origin": entry.get("origin")}
             rseg = rel.split("/")
             n = 0
             for a, b in zip(reversed(rseg), reversed(cseg)):
@@ -177,16 +200,21 @@ class ProjectState:
                     break
                 n += 1
             if n >= 2 and (best is None or best["tier"] > 2):
-                best = {"path": changed, "tier": 2, "confidence": 0.8, "matched": rel}
+                best = {"path": changed, "tier": 2, "confidence": 0.8, "matched": rel,
+                        "origin": entry.get("origin")}
             elif n == 1 and best is None:
-                best = {"path": changed, "tier": 3, "confidence": 0.5, "matched": rel}
+                best = {"path": changed, "tier": 3, "confidence": 0.5, "matched": rel,
+                        "origin": entry.get("origin")}
         return best
 
     # ----------------------------------------------------------- triage
-    def call_triage(self, vcs_url: str, commit: str, files: list):
+    def call_triage(self, vcs_url: str, commit: str, files: list, cross_repo: list = None):
+        body = {"vcs_url": vcs_url, "commit": commit, "files": files}
+        if cross_repo:
+            body["cross_repo"] = cross_repo
         req = urllib.request.Request(
             self.triage_url,
-            data=json.dumps({"vcs_url": vcs_url, "commit": commit, "files": files}).encode(),
+            data=json.dumps(body).encode(),
             headers={"Content-Type": "application/json"},
             method="POST",
         )
@@ -246,6 +274,21 @@ class ProjectState:
                 if m:
                     matches.append(m)
 
+            # Cross-repo mirrors: any OTHER component holding the same physical
+            # file (shared origin). A fix that lands here likely needs propagating
+            # to those copies — one of them is probably behind. (Part 2)
+            cross = {}
+            for m in matches:
+                for sib in self.origin_index.get(m.get("origin"), []):
+                    if sib["component"] == watch["component"]:
+                        continue
+                    sw = self.watch_by_component.get(sib["component"])
+                    cross.setdefault(sib["component"], {
+                        "component": sib["component"], "path": sib["rel"],
+                        "vcs_url": sw["url"] if sw else None,
+                        "divergent": bool(sw and sw.get("divergent"))})
+            cross_repo = list(cross.values())
+
             base = {
                 "received_at": now_iso(),
                 "repo": repo_url, "ref": ref,
@@ -255,13 +298,14 @@ class ProjectState:
                 "message": commit.get("message", ""),
                 "files_changed": changed,
                 "in_scope": matches,
+                "cross_repo": cross_repo,
             }
             if not matches:
                 base.update(status="suppressed",
                             reason="no changed file is in the compiled set for this build")
             else:
                 verdict, err = self.call_triage(watch["url"], sha,
-                                                [m["path"] for m in matches])
+                                                [m["path"] for m in matches], cross_repo)
                 if err:
                     base.update(status="triage_error", reason=err)
                 else:
@@ -367,27 +411,40 @@ watched repositories and the upstream commit events being triaged. Triage backen
 
 def render_project(reg: Registry, ps: ProjectState) -> bytes:
     def _pin(w):
-        ref = f"<code>{esc(w['pinned_ref'] or '—')}</code>"
+        ref = (f"<code title='Immutable file-scope ref — the exact snapshot we "
+               f"enumerated files at'>{esc(w['pinned_ref'] or '—')}</code>")
         if w.get("version_source") == "claude-inferred":
             ref += (" <span class='muted' title='Version inferred by Claude — "
                     "Black Duck did not identify this component'>≈ inferred</span>")
         return ref
+
+    def _watch(w):
+        wr = w.get("watch_ref")
+        if not wr:
+            return "<span class='muted'>—</span>"
+        conf, style = w.get("watch_confidence"), w.get("release_style")
+        flag = " ⚠" if conf == "low" else ""
+        title = f"{style or '?'} release style; Claude confidence {conf or '?'}"
+        return (f"<code>{esc(wr)}</code>{flag} "
+                f"<span class='muted' title='{esc(title)}'>[{esc(style or '?')}/{esc(conf or '?')}]</span>")
 
     def _url(w):
         u = f"<code>{esc(w['url'])}</code>"
         bf = w.get("built_from")
         if bf and norm_url(bf) != norm_url(w["url"]):
             warn = " ⚠ divergent" if w.get("divergent") else ""
-            u += (f"<br><span class='muted' title='This build used a local/vendored copy; "
-                  f"the canonical upstream is what we monitor'>↳ built from <code>{esc(bf)}</code>"
-                  f"{warn}</span>")
+            asr = w.get("actual_source_ref")
+            refpart = f"@{esc(asr)}" if asr else ""
+            u += (f"<br><span class='muted' title='Actual source we built from; the "
+                  f"canonical upstream above is what we monitor'>↳ actual source "
+                  f"<code>{esc(bf)}{refpart}</code>{warn}</span>")
         return u
 
     def _rows(ws):
         return "".join(
             f"<tr><td>{esc(w['component'])}</td><td>{_url(w)}</td>"
             f"<td>{esc(w['relationship'])}</td><td>{esc(', '.join(w['provenance']))}</td>"
-            f"<td>{_pin(w)}</td></tr>"
+            f"<td>{_pin(w)}</td><td>{_watch(w)}</td></tr>"
             for w in ws)
 
     mon = [w for w in ps.watches if w.get("monitored", True)]
@@ -404,7 +461,8 @@ def render_project(reg: Registry, ps: ProjectState) -> bytes:
             f"<p class='muted'>In the SBOM but not compiled from source in this build "
             f"(linked/prebuilt) — listed for transparency, excluded from monitoring.</p>"
             f"<table><tr><th>Component</th><th>VCS URL</th><th>Relationship</th>"
-            f"<th>Provenance</th><th>Pinned ref</th></tr>{_rows(ref)}</table>")
+            f"<th>Provenance</th><th>Pinned ref</th><th>Watches (branch)</th></tr>"
+            f"{_rows(ref)}</table>")
 
     def result_card(r):
         status = r["status"]
@@ -417,6 +475,16 @@ def render_project(reg: Registry, ps: ProjectState) -> bytes:
         files = ", ".join(f"<code>{esc(m['path'])}</code> (tier {m['tier']})"
                           for m in r.get("in_scope", [])) or "—"
         rationale = esc((r.get("triage") or {}).get("rationale", r.get("reason", "")))
+        cross_html = ""
+        cross = r.get("cross_repo") or []
+        if cross:
+            items = "; ".join(
+                f"{esc(c['component'])} (<code>{esc(c['path'])}</code>)"
+                f"{' ⚠ divergent' if c.get('divergent') else ''}" for c in cross)
+            cross_html = (
+                f"<div class='muted' style='color:#B9770E;margin-top:6px'>"
+                f"⇄ same file is also in {items} — propagate the fix; the mirrored "
+                f"copy is likely behind</div>")
         return (
             f"<div class='card' style='border-left:6px solid {color}'>"
             f"<div><span class='badge' style='background:{color}'>{esc(label)}</span> "
@@ -424,7 +492,7 @@ def render_project(reg: Registry, ps: ProjectState) -> bytes:
             f"<code>{esc(str(r.get('commit', r.get('commits', '?'))))[:16]}</code> "
             f"<span class='muted'>{esc(r.get('ref', ''))} · {esc(r['received_at'])}</span></div>"
             f"<div class='muted'>in scope: {files}</div>"
-            f"<div class='rationale'>{rationale}</div></div>")
+            f"<div class='rationale'>{rationale}</div>{cross_html}</div>")
 
     cards = "".join(result_card(r) for r in ps.results) or \
         "<p class='muted'>No commit events received yet for this project.</p>"
@@ -434,7 +502,7 @@ def render_project(reg: Registry, ps: ProjectState) -> bytes:
 <h1>{esc(ps.name)} <span class="muted">({esc(ps.build_id)})</span></h1>
 <p class="muted" style="font-size:13px"><b>Precision funnel:</b> {funnel}</p>
 <h2>Monitored repos ({len(mon)})</h2>
-<table><tr><th>Component</th><th>VCS URL</th><th>Relationship</th><th>Provenance</th><th>Pinned ref</th></tr>
+<table><tr><th>Component</th><th>VCS URL</th><th>Relationship</th><th>Provenance</th><th>Pinned ref</th><th>Watches (branch)</th></tr>
 {_rows(mon)}</table>
 {ref_section}
 <h2>Commit events ({len(ps.results)})</h2>

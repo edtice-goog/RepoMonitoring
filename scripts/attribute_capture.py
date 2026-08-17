@@ -30,11 +30,13 @@ built-from provenance, so the UI can be honest about what it knows.
 """
 
 import argparse
+import hashlib
 import json
 import os
 import re
 import subprocess
 import sys
+from collections import defaultdict
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -133,15 +135,27 @@ def claude_from_files(cfg, tails):
 
 
 # --------------------------------------------------------------- .git discovery
+def _git(root, *args):
+    try:
+        return subprocess.check_output(["git", "-C", root, *args],
+                                       text=True, stderr=subprocess.DEVNULL).strip()
+    except Exception:
+        return None
+
+
 def discover_git(gh, paths):
     """For each compiled file, find the enclosing .git checkout and its origin
-    remote (ground-truth: the file IS that repo's code). Resolve each checkout to
-    its canonical upstream via the GitHub fork-parent. Returns:
-        git_attr : compiled_path -> (canonical_norm, repo_rel_path)
-        checkouts: canonical_norm -> {canonical_url, checkout_url, divergent, files}
+    remote. This is the ACTUAL SOURCE (the file literally IS this checkout's code)
+    — including the exact ref built (`rev-parse HEAD` + `describe`). The checkout
+    may be a fork; the GROUND TRUTH (the upstream that matters) is its fork-parent.
+    Returns:
+        git_attr : compiled_path -> (ground_truth_norm, repo_rel_path)
+        checkouts: ground_truth_norm -> {ground_truth_url, actual_source_url,
+                   actual_source_ref, divergent, files}
     """
     dir_cache = {}     # dir -> (checkout_root, origin_url) or (None, None)
     canon_cache = {}   # checkout_url -> canonical_url
+    ref_cache = {}     # checkout_root -> "sha (describe)"
 
     def root_remote(p):
         seen, d = [], os.path.dirname(p)
@@ -153,13 +167,7 @@ def discover_git(gh, paths):
                 return r
             seen.append(d)
             if os.path.isdir(os.path.join(d, ".git")):
-                url = None
-                try:
-                    url = subprocess.check_output(["git", "-C", d, "remote", "get-url", "origin"],
-                                                  text=True, stderr=subprocess.DEVNULL).strip()
-                except Exception:
-                    pass
-                r = (d, url)
+                r = (d, _git(d, "remote", "get-url", "origin"))
                 for s in seen:
                     dir_cache[s] = r
                 return r
@@ -167,6 +175,12 @@ def discover_git(gh, paths):
         for s in seen:
             dir_cache[s] = (None, None)
         return (None, None)
+
+    def exact_ref(root):
+        if root not in ref_cache:
+            sha, desc = _git(root, "rev-parse", "HEAD"), _git(root, "describe", "--tags", "--always")
+            ref_cache[root] = f"{(sha or '?')[:12]}" + (f" ({desc})" if desc and desc != sha else "")
+        return ref_cache[root]
 
     def canonical(url):
         if url in canon_cache:
@@ -192,7 +206,8 @@ def discover_git(gh, paths):
         nc = norm_repo(can)
         rel = p.replace("\\", "/")[len(root.replace("\\", "/")) + 1:] if root else p
         git_attr[p] = (nc, rel)
-        info = checkouts.setdefault(nc, {"canonical_url": can, "checkout_url": url,
+        info = checkouts.setdefault(nc, {"ground_truth_url": can, "actual_source_url": url,
+                                         "actual_source_ref": exact_ref(root),
                                          "divergent": norm_repo(url) != nc, "files": set()})
         info["files"].add(p)
     return git_attr, checkouts
@@ -218,6 +233,72 @@ def fetch_fileset(gh, owner, repo, ref):
     tree = gh.get(f"/repos/{owner}/{repo}/git/trees/{ref}?recursive=1")
     return ({b["path"] for b in tree.get("tree", []) if b.get("type") == "blob"},
             tree.get("truncated", False))
+
+
+# --------------------------------------------------------------- watch-branch resolver
+SYSTEM_WATCH = """\
+You decide WHICH BRANCH to monitor for post-release security fixes, per upstream \
+repository. Key idea: the immutable release tag/commit we built is NOT what we \
+watch (it never moves); we watch the MOVING branch on which fixes for that \
+release line will appear.
+
+For each target you get the repo, the version we built, the repo's branch list, \
+its recent tags, and its default branch. Return, per target:
+- watch_branch: the EXACT branch name (must be one of the provided branches) where \
+fixes for the built version's release line land.
+- release_style: "tag" if the project ships releases as tags and fixes flow onto \
+a default/maintenance branch; "branch" if it maintains a per-release/maintenance \
+branch (e.g. OpenSSL openssl-3.x / OpenSSL_1_1_1-stable, linux-X.Y.y); "unknown" \
+if you cannot tell.
+- confidence: high/medium/low.
+- rationale: one sentence citing the evidence (which branch/convention).
+
+Use your knowledge of each project's real release conventions (OpenSSL uses \
+per-minor stable branches; curl releases from master and back-ports rarely; zlib \
+ships tags off its default branch; the Linux kernel uses linux-X.Y.y stable \
+branches). Prefer a maintenance branch matching the built major.minor when one \
+exists; otherwise the default branch. NEVER invent a branch not in the list."""
+
+
+def resolve_watch_refs(gh, client, targets):
+    """targets: [{slug, owner, repo, version}]. Returns {slug: WatchRef pydantic}.
+
+    Claude picks the moving branch to monitor (release conventions are project-
+    specific — better than hard-coded name guessing). One batched structured call.
+    """
+    from pydantic import BaseModel
+    from typing import List, Literal
+
+    ctx = []
+    for t in targets:
+        o, r = t["owner"], t["repo"]
+        def _safe(path, default):
+            try:
+                return gh.get(path)
+            except Exception:
+                return default
+        branches = [b["name"] for b in _safe(f"/repos/{o}/{r}/branches?per_page=100", [])]
+        tags = [x["name"] for x in _safe(f"/repos/{o}/{r}/tags?per_page=30", [])]
+        default_branch = (_safe(f"/repos/{o}/{r}", {}) or {}).get("default_branch")
+        ctx.append({"slug": t["slug"], "repo": f"{o}/{r}", "built_version": t.get("version"),
+                    "default_branch": default_branch, "branches": branches[:100],
+                    "recent_tags": tags[:30]})
+
+    class WatchRef(BaseModel):
+        slug: str
+        watch_branch: str
+        release_style: Literal["tag", "branch", "unknown"]
+        confidence: Literal["high", "medium", "low"]
+        rationale: str
+
+    class Result(BaseModel):
+        targets: List[WatchRef]
+
+    resp = client.messages.parse(
+        model=MODEL, max_tokens=2000, system=SYSTEM_WATCH,
+        messages=[{"role": "user", "content": json.dumps({"targets": ctx}, indent=2)}],
+        output_format=Result)
+    return {w.slug: w for w in resp.parsed_output.targets}
 
 
 # --------------------------------------------------------------- main
@@ -271,24 +352,28 @@ def main():
             candidates[nk] = {"name": c.name, "slug": slugify(c.name), "vcs_url": c.vcs_url,
                               "version": c.proposed_version, "version_source": "claude-inferred"}
 
-    # (3) .git discovery on the actual checkouts (ground-truth + fork->canonical).
+    # (3) .git discovery: ACTUAL SOURCE (exact checkout + ref) -> GROUND TRUTH
+    #     (fork-parent upstream). Records the provenance triple per repo.
     git_attr, checkouts = discover_git(gh, all_compiled)
     print(f"[git]  {len(checkouts)} checkout(s) discovered on disk:", flush=True)
     for nc, info in checkouts.items():
-        div = "  DIVERGENT (built from a fork/vendored copy)" if info["divergent"] else ""
-        print(f"    - built from {info['checkout_url']} -> canonical {info['canonical_url']}{div}", flush=True)
-        if nc in candidates:                       # same component -> record provenance
-            candidates[nc]["built_from"] = info["checkout_url"]
-            candidates[nc]["divergent"] = info["divergent"]
+        div = "  DIVERGENT (fork/vendored copy)" if info["divergent"] else ""
+        print(f"    - actual source {info['actual_source_url']}@{info['actual_source_ref']} "
+              f"-> ground truth {info['ground_truth_url']}{div}", flush=True)
+        prov = {"actual_source": {"repo": info["actual_source_url"],
+                                  "ref": info["actual_source_ref"]},
+                "ground_truth": info["ground_truth_url"], "divergent": info["divergent"]}
+        if nc in candidates:
+            candidates[nc].update(prov)
         else:                                       # union: never drop a discovered repo
-            owner, repo = parse_owner_repo(info["canonical_url"])
+            owner, repo = parse_owner_repo(info["ground_truth_url"])
             candidates[nc] = {"name": repo or nc, "slug": slugify(repo or nc),
-                              "vcs_url": info["canonical_url"], "version": None,
-                              "version_source": "git-discovered",
-                              "built_from": info["checkout_url"], "divergent": info["divergent"]}
+                              "vcs_url": info["ground_truth_url"], "version": None,
+                              "version_source": "git-discovered", **prov}
     print(f"[union] {len(candidates)} candidate repos", flush=True)
 
-    # (4) enumerate each candidate repo's file tree (for the longest-suffix fallback).
+    # (4) enumerate each candidate repo's file tree at the IMMUTABLE file-scope ref
+    #     (the exact release snapshot) — used only to attribute compiled files.
     filesets = {}
     for cand in candidates.values():
         owner, repo = parse_owner_repo(cand["vcs_url"])
@@ -304,52 +389,98 @@ def main():
             # attribution but kept in the SBOM/union — never fatal to the run.
             print(f"    ! {owner}/{repo}: skipped, tree unavailable ({exc})", flush=True)
             continue
-        cand["ref"] = ref
+        cand["file_scope_ref"] = ref
         filesets[cand["slug"]] = fs
 
-    # (5) attribution: .git ground-truth first, longest-suffix fallback.
+    # (4.5) WATCH ref (moving branch) per candidate — resolved by Claude, since
+    #       release conventions (tag vs per-release branch) are project-specific.
+    wtargets = []
+    for cand in candidates.values():
+        owner, repo = parse_owner_repo(cand["vcs_url"])
+        if owner:
+            wtargets.append({"slug": cand["slug"], "owner": owner, "repo": repo,
+                             "version": cand.get("version")})
+    watch = {}
+    if wtargets:
+        try:
+            watch = resolve_watch_refs(gh, anthropic_client, wtargets)
+            print(f"[watch] Claude resolved watch branches for {len(watch)} repo(s):", flush=True)
+            for slug, w in watch.items():
+                print(f"    - {slug}: watch '{w.watch_branch}'  "
+                      f"[{w.release_style}/{w.confidence}]  {w.rationale}", flush=True)
+        except Exception as exc:
+            print(f"[watch] resolver failed ({exc}); watch refs left unresolved", flush=True)
+    for cand in candidates.values():
+        w = watch.get(cand["slug"])
+        if w:
+            cand.update(watch_ref=w.watch_branch, release_style=w.release_style,
+                        watch_confidence=w.confidence, watch_rationale=w.rationale)
+
+    # (5) attribution: .git ground-truth primary + repo_mapper MULTI-map
+    #     (longest-suffix owners + vendored-copy secondaries). A file may map to
+    #     >1 repo (host + vendored upstream) -> each is watched.
     slug_of_nc = {nc: c["slug"] for nc, c in candidates.items()}
-    need_suffix = [p for p in all_compiled if p not in git_attr]
-    suffix_attr = repo_mapper.attribute(need_suffix, filesets)
-    combined = {}   # path -> (slug, rel, how)
+    mapper = repo_mapper.attribute(sorted(all_compiled), filesets)
+    combined = {}   # path -> [(slug, rel, how)]
     for p in all_compiled:
-        if p in git_attr:
-            nc, rel = git_attr[p]
-            combined[p] = (slug_of_nc.get(nc), rel, "git")
-        else:
-            a = suffix_attr.get(p)
-            combined[p] = ((a.repo, a.rel, "suffix") if a else None)
+        attrs, seen = [], set()
+        if p in git_attr:                           # ground truth first
+            slug = slug_of_nc.get(git_attr[p][0])
+            if slug:
+                attrs.append((slug, git_attr[p][1], "git"))
+                seen.add(slug)
+        for a in mapper.get(p, []):                 # + suffix/vendored, deduped
+            if a.repo not in seen:
+                attrs.append((a.repo, a.rel, a.kind))
+                seen.add(a.repo)
+        combined[p] = attrs
 
-    # (6) monitored iff a PRIMARY TU landed on the repo (canonical slug).
-    monitored = sorted({combined[p][0] for p in primaries
-                        if combined.get(p) and combined[p][0]})
+    # (6) monitored iff a repo owns >=1 PRIMARY TU via ANY of its attributions.
+    monitored = sorted({slug for p in primaries for (slug, _, _) in combined.get(p, [])})
     print(f"[classify] monitored (own >=1 primary TU): {monitored}", flush=True)
+    kinds_by_repo = defaultdict(set)
+    for p in primaries:
+        for (slug, _, how) in combined.get(p, []):
+            kinds_by_repo[slug].add(how)
+    vendored_only = sorted(s for s in monitored if kinds_by_repo[s] == {"vendored"})
+    if vendored_only:
+        print(f"[vendored] {vendored_only}: monitored via a vendored-copy source only "
+              "(host owns the file directly; upstream is watched for the fix)", flush=True)
 
+    # (7) per-attribution file index. One physical compiled file mapping to N repos
+    #     yields N entries sharing an `origin` key so Part-2 can flag mirrored copies.
     files = []
-    for cp, c in sorted(combined.items()):
-        if c and c[0] in monitored:
-            files.append({"path": f"{c[0]}/{c[1]}", "component": c[0],
-                          "kind": "header" if cp.lower().endswith(HDR_EXT) else "source",
-                          "resolution": c[2]})
+    for cp in sorted(all_compiled):
+        origin = hashlib.sha1(cp.replace("\\", "/").lower().encode()).hexdigest()[:12]
+        for (slug, rel, how) in combined.get(cp, []):
+            if slug in monitored:
+                files.append({"path": f"{slug}/{rel}", "component": slug,
+                              "kind": "header" if cp.lower().endswith(HDR_EXT) else "source",
+                              "resolution": how, "origin": origin})
 
     slug_by = {c["slug"]: c for c in candidates.values()}
     repos_detected = []
     for slug in monitored:
         c = slug_by[slug]
         entry = {"local_path": slug, "associated_component": slug,
-                 "pinned_ref": c.get("ref") or c.get("version"),
+                 "pinned_ref": c.get("file_scope_ref") or c.get("version"),
+                 "watch_ref": c.get("watch_ref"), "watch_confidence": c.get("watch_confidence"),
+                 "release_style": c.get("release_style"),
                  "vcs_urls": [{"url": c["vcs_url"], "relationship": "upstream",
                                "found_in": "bdcpp+mapper"}]}
-        if c.get("built_from"):
-            entry["built_from"] = c["built_from"]
+        asrc = c.get("actual_source")
+        if asrc:
+            entry["built_from"] = asrc["repo"]
+            entry["actual_source_ref"] = asrc["ref"]
             entry["divergent"] = c.get("divergent", False)
         repos_detected.append(entry)
     (args.dir / "build-capture.json").write_text(json.dumps({
-        "_comment": ("Compiled-file index from a REAL BD/CPP capture, attributed by "
-                     ".git ground-truth (fork resolved to canonical) with longest-suffix "
-                     "fallback, over union(BD BoM, Claude-from-files, .git). Anchored on "
-                     "the CANONICAL repo so upstream security commits match; a divergent "
-                     "local checkout is recorded as provenance, not a second watch target."),
+        "_comment": ("Compiled-file index from a REAL BD/CPP capture. Attributed by "
+                     ".git ground-truth + repo_mapper multi-map (a file may map to >1 "
+                     "repo: host + vendored upstream). Each repo carries the provenance "
+                     "triple (actual source / ground truth / fallback) and a Claude- "
+                     "resolved watch_ref (the moving branch), distinct from the immutable "
+                     "pinned_ref used for file scope."),
         "project": args.project, "build_id": f"{args.project}@{args.version}",
         "repos_detected": repos_detected, "files": files,
     }, indent=2), encoding="utf-8")
@@ -358,9 +489,15 @@ def main():
     for c in candidates.values():
         it = {"componentName": c["name"], "componentVersionName": c.get("version") or "?",
               "vcsUrl": c["vcs_url"], "versionSource": c["version_source"],
-              "monitored_hint": c["slug"] in monitored}
-        if c.get("built_from"):
-            it["builtFrom"] = c["built_from"]
+              "monitored_hint": c["slug"] in monitored,
+              "watchRef": c.get("watch_ref"), "watchConfidence": c.get("watch_confidence"),
+              "releaseStyle": c.get("release_style"), "fileScopeRef": c.get("file_scope_ref"),
+              "fallback": {"component": c["name"], "version": c.get("version"),
+                           "source": c["version_source"]}}
+        asrc = c.get("actual_source")
+        if asrc:
+            it["builtFrom"] = asrc["repo"]
+            it["actualSourceRef"] = asrc["ref"]
             it["divergent"] = c.get("divergent", False)
         items.append(it)
     (args.dir / "hub-api-components.json").write_text(json.dumps({
@@ -370,12 +507,13 @@ def main():
     }, indent=2), encoding="utf-8")
 
     ref_only = [c["slug"] for c in candidates.values() if c["slug"] not in monitored]
-    print(f"[write] build-capture.json: {len(files)} indexed files for {monitored}", flush=True)
+    print(f"[write] build-capture.json: {len(files)} index entries for {monitored}", flush=True)
     print(f"[result] monitored={monitored}  reference-only={ref_only}", flush=True)
     for c in candidates.values():
         if c.get("divergent"):
-            print(f"[provenance] {c['slug']}: monitoring canonical {c['vcs_url']}, "
-                  f"BUILT FROM divergent local copy {c['built_from']}", flush=True)
+            print(f"[provenance] {c['slug']}: ground truth {c['vcs_url']} @ watch "
+                  f"'{c.get('watch_ref')}'; ACTUAL SOURCE (divergent) "
+                  f"{c['actual_source']['repo']}@{c['actual_source']['ref']}", flush=True)
 
 
 if __name__ == "__main__":
