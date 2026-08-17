@@ -1,10 +1,14 @@
-# Optional dependencies for the LIVE demo features only.
-# The core deterministic demo (monitor/, triage-service/, driver/) needs NONE
-# of these — it runs on the Python standard library alone.
+# Dependencies for the LIVE pipeline (provisioning, recreation, DB/cache).
 #
 #   pip install -r requirements-live.txt
 #
-# Used by scripts/bd_provision.py (live Black Duck BOM pull + Claude VCS
-# enhancement). The Black Duck REST calls use urllib (stdlib); only the Claude
-# enhancement needs the Anthropic SDK.
+# Claude VCS/triage/watch enhancement (Black Duck + GitHub REST use urllib/stdlib).
 anthropic>=0.40
+
+# Durable seeds (Postgres) + recreatable cache (Redis) backing the recreate pipeline.
+# Postgres/Redis run locally in WSL2 (see infra/stack.sh); the app connects over
+# localhost. psycopg[binary] bundles libpq so nothing extra is needed on Windows.
+SQLAlchemy>=2.0
+alembic>=1.13
+psycopg[binary]>=3.1
+redis>=5.0

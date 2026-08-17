@@ -1,8 +1,9 @@
 """Webhook replay driver for the RepoMonitoring demo.
 
-Reads the simulated upstream commits from samples/commit-events.json,
-converts each to a standard Git webhook payload (GitHub push-event format),
-and POSTs it to the monitoring component's /webhook endpoint.
+Reads real upstream commits from a recreated events file (e.g.
+live-stage3/<project>-commit-events.json), converts each to a standard Git
+webhook payload (GitHub push-event format), and POSTs it to the monitoring
+component's /webhook endpoint.
 
 Modes:
     python replay.py                  interactive — press Enter to fire each
@@ -19,7 +20,6 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
-DEFAULT_EVENTS = Path(__file__).resolve().parent.parent / "samples" / "commit-events.json"
 DEFAULT_WEBHOOK = "http://127.0.0.1:8378/webhook"
 
 
@@ -74,7 +74,8 @@ def send(webhook_url: str, event: dict) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument("--events", type=Path, default=DEFAULT_EVENTS)
+    parser.add_argument("--events", type=Path, required=True,
+                        help="commit-events JSON to replay (e.g. live-stage3/<project>-commit-events.json)")
     parser.add_argument("--webhook", default=DEFAULT_WEBHOOK)
     parser.add_argument("--event", help="fire a single event by id (e.g. evt-001)")
     parser.add_argument("--all", action="store_true", help="fire all events without prompting")

@@ -11,10 +11,8 @@ _extracted.txt
 # Never commit real credentials; copy blackduck.local.example.json and fill in.
 blackduck.local.json
 
-# Live provisioning output (instance-derived watch manifests) and local venvs.
-live/
-live-stage3/
-live-busybox/
+# Live provisioning / recreation output (instance-derived, regenerable) and venvs.
+live*/
 .venv/
 
 __pycache__/

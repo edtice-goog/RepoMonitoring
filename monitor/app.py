@@ -26,14 +26,17 @@ Usage:
 
 import argparse
 import json
+import sys
+import threading
 import urllib.error
 import urllib.request
 from datetime import datetime, timezone
-from http.server import BaseHTTPRequestHandler, HTTPServer, ThreadingHTTPServer
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, quote, unquote, urlparse
 
-DEFAULT_DATA_DIR = Path(__file__).resolve().parent.parent / "samples"
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))  # repo root (for provisioning.*)
+
 DEFAULT_TRIAGE_URL = "http://127.0.0.1:8377/triage"
 
 
@@ -72,6 +75,17 @@ class ProjectState:
         self.results = []          # processed commit results, newest first
         self.project = "?"
         self.build_id = "?"
+        self.recreate_status = {"state": "idle", "summary": None, "error": None, "at": None}
+        self.recreate_lock = threading.Lock()
+        self._load()
+
+    def reload(self) -> None:
+        """Re-read the (freshly recreated) JSON in place, keeping runtime results."""
+        self.watches = []
+        self.watch_by_url = {}
+        self.watch_by_component = {}
+        self.file_index = {}
+        self.origin_index = {}
         self._load()
 
     def _load(self) -> None:
@@ -128,6 +142,14 @@ class ProjectState:
                     # used a local/vendored copy that diverges from it.
                     w["built_from"] = item.get("builtFrom")
                     w["divergent"] = item.get("divergent", False)
+                    # Watch ref / provenance for repos that arrive only via the hub
+                    # (e.g. reference-only components not in repos_detected).
+                    for src, dst in (("watchRef", "watch_ref"),
+                                     ("watchConfidence", "watch_confidence"),
+                                     ("releaseStyle", "release_style"),
+                                     ("actualSourceRef", "actual_source_ref")):
+                        if item.get(src) is not None and w.get(dst) is None:
+                            w[dst] = item.get(src)
 
         # Compiled-file index: strip each file's repo-local prefix so paths
         # are upstream-repo-relative, ready for suffix matching.
@@ -314,6 +336,22 @@ class ProjectState:
             summaries.append({"commit": sha, "status": base["status"],
                               "verdict": base.get("triage", {}).get("verdict")})
         return {"status": "processed", "commits": summaries}
+
+    # ----------------------------------------------------------- recreate (UI button)
+    def run_recreate(self, refresh_sbom=True) -> None:
+        """Refresh the BoM from Black Duck + re-run the cache-backed pipeline, then
+        reload this project's manifest. Runs in a background thread; warm cache =
+        near-instant, a grown BoM = a few cache misses. Status drives the UI."""
+        try:
+            from provisioning.recreate import recreate_project
+            summary = recreate_project(self.project, self.data_dir,
+                                       refresh_sbom=refresh_sbom, log=lambda m: None)
+            self.reload()
+            self.recreate_status = {"state": "done", "summary": summary,
+                                    "error": None, "at": now_iso()}
+        except Exception as exc:  # keep the server alive; surface the error in the UI
+            self.recreate_status = {"state": "error", "summary": None,
+                                    "error": repr(exc), "at": now_iso()}
 
     # ----------------------------------------------------------- summary
     def summary(self) -> dict:
@@ -522,9 +560,30 @@ def render_project(reg: Registry, ps: ProjectState) -> bytes:
     cards = "".join(result_card(r) for r in ps.results) or \
         "<p class='muted'>No commit events received yet for this project.</p>"
 
+    rs = ps.recreate_status
+    if rs["state"] == "running":
+        st = "<span style='color:#B9770E'>recreating… refreshing BoM + cache-backed rebuild</span>"
+    elif rs["state"] == "done":
+        s = rs["summary"] or {}
+        st = (f"<span style='color:#2E7D32'>last recreate {esc(rs['at'])}: "
+              f"{s.get('external_calls', '?')} external call(s), monitored="
+              f"{esc(s.get('monitored'))}</span>")
+        if (s.get("warnings") or []):
+            st += f" <span style='color:#B9770E'>· {esc('; '.join(s['warnings']))}</span>"
+    elif rs["state"] == "error":
+        st = f"<span style='color:#C0392B'>recreate error: {esc(rs['error'])}</span>"
+    else:
+        st = "<span class='muted'>idle</span>"
+    recreate_html = (
+        f"<button onclick=\"this.disabled=true;fetch('/recreate?project={quote(ps.name)}',"
+        f"{{method:'POST'}}).then(()=>setTimeout(()=>location.reload(),500))\" "
+        f"style='background:#582C83;color:#fff;border:0;border-radius:4px;padding:6px 12px;"
+        f"cursor:pointer;font-size:13px'>&#x1F504; Recreate</button> <span style='font-size:12px'>{st}</span>")
+
     body = f"""
 <p><a href="/">&larr; Projects</a></p>
 <h1>{esc(ps.name)} <span class="muted">({esc(ps.build_id)})</span></h1>
+<p>{recreate_html}</p>
 <p class="muted" style="font-size:13px"><b>Precision funnel:</b> {funnel}</p>
 <h2>Monitored repos ({len(mon)})</h2>
 <table><tr><th>Component</th><th>VCS URL</th><th>Relationship</th><th>Provenance</th><th>Pinned ref</th><th>Watches (branch)</th></tr>
@@ -580,7 +639,28 @@ class MonitorHandler(BaseHTTPRequestHandler):
             self._send_json(404, {"error": f"unknown path {self.path}"})
 
     def do_POST(self) -> None:
-        if self.path != "/webhook":
+        parsed = urlparse(self.path)
+
+        # UI action: recreate a project's artifacts from DB seeds + cache (background).
+        if parsed.path == "/recreate":
+            qs = parse_qs(parsed.query)
+            project = unquote(qs["project"][0]) if "project" in qs else None
+            ps = self.reg.projects.get(project)
+            if ps is None:
+                self._send_json(404, {"error": f"unknown project {project}"})
+                return
+            with ps.recreate_lock:
+                if ps.recreate_status["state"] == "running":
+                    self._send_json(409, {"status": "busy"})
+                    return
+                ps.recreate_status = {"state": "running", "summary": None,
+                                      "error": None, "at": now_iso()}
+            threading.Thread(target=ps.run_recreate, kwargs={"refresh_sbom": True},
+                             daemon=True).start()
+            self._send_json(202, {"status": "started", "project": project})
+            return
+
+        if parsed.path != "/webhook":
             self._send_json(404, {"error": f"unknown path {self.path}"})
             return
         event_type = self.headers.get("X-GitHub-Event", "push")
@@ -607,12 +687,12 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--port", type=int, default=8378)
     parser.add_argument("--data-dir", type=Path, action="append", dest="data_dirs",
+                        required=True,
                         help="a project data dir (repeatable; one per BD SCA project)")
     parser.add_argument("--triage-url", default=DEFAULT_TRIAGE_URL)
     args = parser.parse_args()
 
-    data_dirs = args.data_dirs or [DEFAULT_DATA_DIR]
-    MonitorHandler.reg = Registry(data_dirs, args.triage_url)
+    MonitorHandler.reg = Registry(args.data_dirs, args.triage_url)
     print(f"[monitor] {len(MonitorHandler.reg.projects)} project(s):")
     for name, ps in MonitorHandler.reg.projects.items():
         print(f"[monitor]   {name}: {len(ps.watches)} repos, "

@@ -1,264 +1,126 @@
 # RepoMonitoring — Demo Instructions
 
-A deterministic, self-contained demo of upstream security-fix monitoring for
-embedded builds. Everything runs locally; there is no network access beyond
-localhost, no API keys, and no external dependencies.
+A patch-gap monitor for embedded builds: it watches the upstream repos that feed a
+build and triages each new commit as "quiet security fix" vs. routine. The demo runs
+on a **real** captured project (cURL 8.11 + zlib 1.3.1 from source, linking OpenSSL
+3.6.3) — there is no fictitious data.
 
-## What you need
+## Architecture
 
-- **Python 3.8 or newer** — nothing else. No `pip install`, no virtualenv.
-  - Windows: `python` or `py`
-  - Linux/macOS: `python3`
-- A web browser.
-- Three terminal windows (two for services, one for firing events).
-
-Throughout these instructions, `python` means whatever invokes Python on your
-machine (`py` on some Windows installs, `python3` on Linux/macOS).
-
-## What's in the box
-
-| Path | What it is |
+| Component | What it is |
 |---|---|
-| `monitor/app.py` | The monitoring component: multi-project web dashboard + Git webhook endpoint |
-| `triage-service/server.py` | Stub "LLM triage service" (deterministic truth table) |
-| `driver/replay.py` | Fires simulated upstream commits at the monitor as standard Git webhooks |
-| `samples/` | Fictitious tool artifacts: build capture, SBOMs (3 formats), commit events, triage verdicts |
-| `samples/README.md` | Why each artifact looks the way it does |
-| `DESIGN.md` | Architecture and long-term vision (Black Duck SCA integration) |
+| `monitor/app.py` | Multi-project web dashboard + Git webhook endpoint + **Recreate** button |
+| `triage-service/claude_server.py` | LLM triage (Claude) with a persistent cache; `--cache-only` for keyless replay |
+| `driver/replay.py` | Fires saved upstream commits at the monitor as standard Git webhooks |
+| `provisioning/ingest.py` | **Once per release:** writes the can't-recreate seeds to Postgres |
+| `provisioning/recreate.py` | Rebuilds a project's dashboard artifacts from seeds + cache (0 external calls warm) |
+| `db/` + `alembic/` | Postgres schema (SQLAlchemy) — the 3 seed tables |
+| `services/cache.py` | Redis cache: every external result stored once, keyed by input |
+| `infra/stack.sh` + `infra/redis.conf` | User-owned Postgres + Redis in WSL2 (persistent, no Docker) |
 
-The fictitious device is the **ACME GW-7100**, an embedded network gateway
-built from source (Yocto-style) from three components: a forked Linux kernel,
-BusyBox, and zlib.
+**Two data classes.** Postgres holds only what can't be recreated — the BD SCA project
+*link*, the distilled Coverity compiled-file set, and the `.git` provenance (actual
+source → canonical). Everything recreatable — the BD SBoM, Claude outputs, GitHub
+trees/commits/diffs, triage verdicts — lives in the Redis cache. A full **recreate**
+re-runs the whole pipeline but every external step is a cache hit, so a warm rebuild
+makes **zero** Claude/GitHub calls. When the SCA KB grows, the new component is a cache
+miss that fetches exactly once.
 
-## Running the demo
+## Prerequisites
 
-### 1. Start the triage service (terminal 1)
+1. `pip install -r requirements-live.txt` (anthropic, SQLAlchemy, alembic, psycopg, redis).
+2. **Datastores** (WSL2, one-time): the install of `postgresql` + `redis-server` needs
+   sudo once; after that the stack is user-owned and needs no root:
+   ```bash
+   wsl -d Ubuntu -- sudo bash -c 'apt-get update && apt-get install -y postgresql redis-server'
+   ```
+3. `blackduck.local.json` (gitignored) — copy `blackduck.local.example.json` and fill in
+   `url`, `api_token`, `anthropic_api_key`.
+4. A GitHub login for commit/tree pulls: `gh auth login` (or `GITHUB_TOKEN`).
 
-```
-cd <unzipped folder>
-python triage-service/server.py
-```
+## One-time setup
 
-You should see: `[triage-stub] serving on http://127.0.0.1:8377 ...`
+```bash
+# 1. bring up the user-owned Postgres + Redis (ports 5544 / 6380, persistent AOF)
+wsl -d Ubuntu -- bash infra/stack.sh up
 
-### 2. Start the monitoring component (terminal 2)
+# 2. create the schema
+python -m alembic upgrade head
 
-```
-cd <unzipped folder>
-python monitor/app.py
-```
-
-You should see it list **1 project** (`acme-gw7100-firmware`) with its watched
-repos and indexed files, then:
-`[monitor] dashboard http://127.0.0.1:8378/ ...`
-
-### 3. Open the dashboard
-
-Browse to **http://127.0.0.1:8378/** — it refreshes itself every 3 seconds.
-
-The landing page is the **project list**: one row per Black Duck SCA project
-(1:1), with its component / monitored / reference-only counts and event tallies.
-Click a project to drill in. Each project's page shows its **watch manifest**:
-the repos derived from that project's build capture and SBOM, including both
-ACME's internal kernel fork *and* its kernel.org upstream (fixes land upstream
-first; the fork is what gets built), with provenance for how each URL was
-discovered. Load several projects at once by repeating `--data-dir` — e.g.
-`python monitor/app.py --data-dir samples --data-dir live --data-dir live-stage3`
-gives a three-project landing page you can drill into and filter events by.
-(A push to a shared upstream — zlib, OpenSSL — routes to *every* project that
-watches it, so one upstream fix fans out across all affected projects.)
-
-### 4. Fire the simulated commit events (terminal 3)
-
-Interactive mode pauses before each event so you can narrate and watch the
-dashboard update:
-
-```
-cd <unzipped folder>
-python driver/replay.py
+# 3. seed the can't-recreate tables from the real capture (needs the checkouts + idir)
+python provisioning/ingest.py --project repo-mon-stage3-curl --version 8.11.0
 ```
 
-Or fire one at a time with `--event evt-001` (… `evt-004`), or everything at
-once with `--all`. `--list` shows the scenarios.
+After step 3 the local build (`stage3/`, the Coverity idir) can be deleted — everything
+else is recreatable from the seeds + cache.
 
-## What each event demonstrates
+## Recreate the dashboard artifacts
 
-| Event | Upstream commit | Expected dashboard result |
-|---|---|---|
-| **evt-001** | BusyBox: "udhcp: tidy option walking" — a *quiet* security fix touching `dhcpc.c` + `packet.c` + a docs file | **Red — response_required.** Both parser files matched in-scope (tier 1) and evaluated together in one triage call; the docs file excluded. Rationale: bounds checks quietly added to DHCP option parsing — public fix, no advisory yet. |
-| **evt-002** | Linux: a *real* security fix in the ath11k wireless driver | **Green — suppressed.** The GW-7100 never builds that driver, so the commit is never selected and triage is never called. A CVE-feed tool would have paged someone. This is the precision story. |
-| **evt-003** | Linux: "skbuff: simplify clone path" — ambiguous pointer reorder in `net/core/skbuff.c` | **Amber — needs_human_review.** Could be a use-after-free fix, could be cosmetic; routed to the human queue with reasoning. (Phase-1 rollout: humans triage, the filter does noise reduction.) |
-| **evt-004** | zlib: K&R→ANSI declaration modernization in `zutil.c` | **Gray — not_meaningful.** In-scope but no security relevance; verdict and rationale logged for audit, no alert. |
-
-Talking points baked into the data:
-
-- **The commit hash is the unit of triage** — evt-001 shows two in-scope files
-  from one commit evaluated together under a single verdict.
-- **Every verdict carries reasoning** — including the suppressions; nothing is
-  silently dropped. (Triage rationale text is simulated LLM output; in
-  production a live model sits behind the same `/triage` endpoint.)
-- **Fork + upstream both watched** — see the kernel rows in the watch manifest.
-
-## Resetting between runs
-
-The monitor keeps state in memory only. Stop it (Ctrl+C in terminal 2) and
-start it again — the event feed is empty and the demo is ready to replay.
-
-## Live mode (optional) — real Black Duck + Claude + GitHub data
-
-Everything above is the **self-contained, offline demo** (Stage 1): fictitious
-ACME GW-7100 data, no network, no keys. That path is unchanged and always
-available. Two further stages layer *real* data on top of the same monitor and
-driver — useful for building an audience's suspension of disbelief
-progressively:
-
-| Stage | Watch manifest | Commit events | Compiled-file index |
-|---|---|---|---|
-| **1 — sample** (default) | hand-crafted `samples/` | hand-crafted `samples/` | hand-crafted `samples/` |
-| **2 — live provisioned** | **live Black Duck BOM**, VCS URLs **resolved by Claude** | **real upstream commits from GitHub** (cached) | real source tree at the release tag (approximated) |
-| **3 — genuinely captured** | live Black Duck BOM | real commits | **real BD/CPP Coverity capture** of a build we ran ourselves |
-
-Stage 2 is what the `scripts/` helpers produce from a binary-scan BOM: its
-compiled-file index is *approximated* by each component's released source tree
-(honest stand-in, flagged `gh_tree_approx`), because WinSCP can't be built
-without the Embarcadero C++Builder toolchain.
-
-**Stage 3 is real.** We build a project ourselves under BD/CPP so the
-compiled-file index is authoritative — which is the only way to truthfully
-separate *monitored* (compiled from source) from *reference-only* (linked but
-not compiled). The reference build is **cURL 8.11 + zlib 1.3.1 compiled from
-source, linking a prebuilt OpenSSL 3.6.3**:
-
-- `stage3/` (outside the repo) holds the source, an OpenSSL-from-source build
-  (`build_openssl.bat` — the linked "vendor" lib), and `build_capture.bat` which
-  clean-builds curl + zlib. `capture.bat` runs `blackduck-c-cpp` over that build
-  and pushes project `repo-mon-stage3-curl` to Black Duck.
-- `scripts/attribute_capture.py` builds the watch set **without assuming files
-  are tidily arranged by component** (if they were, you wouldn't need SCA). It
-  takes the union of the **Black Duck BoM** and a **Claude reconstruction from the
-  compiled file paths** (`cov_emit_links.json`), enumerates each candidate repo's
-  file tree, and attributes every compiled file to repos via the mapping service
-  (`scripts/repo_mapper.py`). A repo is **monitored iff it owns ≥1 *primary*
-  translation unit** — OpenSSL, whose headers were `#included` but whose `.c` were
-  never compiled, owns none → reference-only. Build tools (CMake) are excluded.
-  Three refinements make the watch model exact:
-  - **Multi-attribution.** `repo_mapper` maps each file to a *list* of repos, not
-    one. A file both built directly and inline-vendored (e.g. `third_party/zlib/…`)
-    belongs to the host *and* to upstream zlib — both are watched. A directory-level
-    *vendored-cluster* test licenses the low-confidence upstream match so a whole
-    vendored subtree fans out while a lone shared basename does not.
-  - **Provenance triple.** Per repo we record the **actual source** (the exact
-    `.git` checkout + ref we built, may be a fork), the **ground truth** (its
-    fork-parent / upstream canonical — what we watch), and the **fallback** (the SCA
-    identity). All three, cross-checking.
-  - **Watch ref via Claude.** The immutable pinned tag is *not* what we watch (it
-    never moves). A Claude call picks the moving branch where post-release fixes
-    land per project convention — curl→`master`, zlib→`develop`, OpenSSL→
-    `openssl-3.6` (the per-minor stable branch a name heuristic would miss) — with
-    a confidence flag. Run it:
-
+```bash
+python provisioning/recreate.py --project repo-mon-stage3-curl --out-dir live-stage3
 ```
-python scripts/attribute_capture.py     # BD BoM ∪ Claude-from-files → mapped index + union manifest
-python scripts/gh_replay.py --manifest live-stage3/hub-api-components.json --out-dir live-stage3 --events-name stage3-commit-events.json --events-only --commits 6
-python triage-service/claude_server.py
+
+- **Cold cache:** makes the BD/Claude/GitHub calls once, populating Redis.
+- **Warm cache:** `external_calls: 0` — identical output, no network.
+- `--refresh-sbom` re-pulls the BD SBoM to pick up KB growth (new components miss + fetch
+  once); `--refresh-events` re-pulls commits on the watch branches.
+
+## Run the demo
+
+Three terminals (datastores already up from setup):
+
+```bash
+python triage-service/claude_server.py            # or --cache-only for keyless replay
 python monitor/app.py --data-dir live-stage3
-python driver/replay.py --events live-stage3/stage3-commit-events.json --all
+python driver/replay.py --events live-stage3/repo-mon-stage3-curl-commit-events.json --all
 ```
 
-The dashboard shows the **precision funnel** (SBOM 3 → compiled 2 → monitored 2 ·
-reference-only 1), curl+zlib under *Monitored repos*, OpenSSL under *Referenced,
-not monitored*, and OpenSSL's commits marked `not_monitored` (short-circuited at
-the repo level — never relevance-filtered or triaged). A version Black Duck
-couldn't supply (a repo only Claude spotted) is shown with an `≈ inferred` flag.
+Open **http://127.0.0.1:8378/** — the project list. Click a project to drill in.
 
-**Vendored / forked copies.** Building from source often means *vendor edits* — a
-local fork. We must not be fooled into monitoring the inert local copy; security
-patches land in the **canonical** project repo. `attribute_capture` handles this
-via **`.git` discovery**: each compiled file's enclosing checkout and `origin`
-remote are read (ground-truth attribution — no path guessing), and a fork is
-resolved to its canonical via the GitHub **fork-parent**. We then **monitor the
-canonical**, and record the local checkout as **divergent provenance** shown as
-`↳ actual source <fork>@<ref> ⚠ divergent` under the repo. Demonstrated by forking
-`madler/zlib` → `edtice-goog/zlib`, editing `compress.c`, and rebuilding: zlib is
-monitored on `madler/zlib` with the fork flagged (actual source
-`edtice-goog/zlib@59933eca…`, one commit past `v1.3.1`), curl on `curl/curl` (no
-divergence), OpenSSL reference-only.
+Load several projects with repeated `--data-dir`. A push to a shared upstream (zlib,
+OpenSSL) routes to every project that watches it.
 
-**Copies vendored *inside* another repo** (no `.git` of their own — e.g.
-`third_party/zlib/…`) are handled by multi-attribution rather than `.git`: the file
-maps to both the host and upstream zlib, so both are watched. And when a fix lands
-in one, the triage output carries a **cross-repo "patch everywhere" note** — the
-same physical file is compiled into the other repo (linked by a shared `origin`
-key), and a fix present in one location but not its mirror means one copy is behind.
-The stub emits a deterministic note; the live Claude triage reasons about
-propagation. (Shown by the synthetic `demo-vendored-curl` fixture; the real curl
-build has no inline vendoring, so its cards carry no note.)
+### What the dashboard shows
 
-### Prerequisites for live mode
+- **Precision funnel** — SBoM (BD) → compiled-from-source (BD/CPP) → monitored ·
+  reference-only. For this build: 3 → 2 → **monitored curl + zlib**, OpenSSL
+  reference-only (linked, never compiled → its commits are `not_monitored`).
+- **Watch model** — each monitored repo shows the immutable *pinned ref* (file-scope
+  snapshot) and, separately, the moving *watch branch* Claude resolved (curl→`master`,
+  zlib→`develop`, OpenSSL→`openssl-3.6`). zlib carries `↳ actual source
+  edtice-goog/zlib@… ⚠ divergent` — built from a fork, monitored on canonical `madler/zlib`.
+- **Verdicts** — response_required (red), needs_human_review (amber), not_meaningful
+  (light green), suppressed (green, not in the compiled set), not_monitored (grey).
+  Every card has a collapsible "N changed files" list; in-scope files are tagged.
+- **Cross-repo "patch everywhere"** — if the same physical file is compiled into more
+  than one repo (an inline-vendored copy), a fix in one surfaces a note to propagate it.
 
-1. `pip install -r requirements-live.txt` (adds the `anthropic` SDK; the offline
-   demo needs nothing).
-2. Copy `blackduck.local.example.json` to `blackduck.local.json` (gitignored)
-   and fill in `url`, `api_token` (Black Duck access token), `anthropic_api_key`,
-   and the `project` / `version` to provision.
-3. A GitHub login for the commit pull: `gh auth login` (or set `GITHUB_TOKEN`).
+### The Recreate button
 
-### Building the live artifacts (one time — writes to `live/`, gitignored)
+On a project page, **🔄 Recreate** refreshes the BoM from Black Duck and re-runs the
+cache-backed pipeline in the background (status shown inline). Unchanged BoM ⇒ one BD
+call, no Claude/GitHub. Grown BoM ⇒ the new component fetches once. No terminal needed.
 
-```
-python scripts/bd_scout.py                 # optional: find a project with a 3-7 component BOM
-python scripts/bd_provision.py             # live BD BOM + Claude VCS enhancement -> live/hub-api-components.json
-python scripts/gh_replay.py --commits 8    # real commits + file index    -> live/winscp-commit-events.json, live/build-capture.json
-```
+## Triage backends
 
-The commit/index data for an old release tag is effectively static, so fetch it
-**once** and replay the saved files thereafter — no repeated GitHub calls.
+`claude_server.py` calls Claude for a real verdict and **caches input→output** (keyed by
+`{vcs_url, commit, files, cross_repo}`). First pass is slow; every repeat is an instant
+cache hit with no token spend. `--cache-only` serves purely from cache (offline, keyless)
+and fails safe on a miss. Default model `claude-opus-4-6`; `--model claude-opus-5` for
+production-grade verdicts (clear the cache when changing models).
 
-### Running the live demo (same three terminals, `--data-dir live`)
+## Reset / persistence
 
-```
-python triage-service/server.py
-python monitor/app.py --data-dir live
-python driver/replay.py --events live/winscp-commit-events.json --all
-```
-
-The dashboard now shows the live watch manifest (real repos, `sca:kb_vcs_url` +
-`capture:gh_tree` provenance, real pinned refs) and real upstream commits sorted
-into in-scope (triaged) vs suppressed.
-
-**Triage backend — stub vs live Claude.** With the *stub* `server.py`, every
-matched real commit routes to `needs_human_review` (it only knows the four canned
-sample hashes and fails safe on the rest). To get **real per-commit verdicts**,
-run the live triage service instead of the stub in terminal 1:
-
-```
-python triage-service/claude_server.py     # calls Claude; same port/contract as the stub
-```
-
-It fetches each commit's message + diff from GitHub, asks Claude for a structured
-verdict, and **caches input→output under `live/triage-cache/`**. The first pass is
-slow (one model call per matched commit); every repeat of the same request is an
-instant cache hit with no token spend — so re-running the demo, or two users
-issuing the same request, share one answer. Default model is the economical
-`claude-opus-4-6`; pass `--model claude-opus-5` for production-grade verdicts
-(clear `live/triage-cache/` when changing models). `--cache-only` serves purely
-from cache (offline, no keys) and fails safe on a miss.
-
-## Resetting between runs (live mode)
-
-Same as above — the monitor holds no disk state. To re-fetch live data (e.g.
-after a new Black Duck scan), re-run the `scripts/` steps; the `live/` directory
-is overwritten and is gitignored so instance-specific data never gets committed.
+- The monitor holds event state in memory only — Ctrl+C and restart to clear the feed.
+- The Redis cache and Postgres seeds **persist to disk** (AOF + RDB). After a reboot,
+  `wsl -d Ubuntu -- bash infra/stack.sh up` brings the stack back with the cache warm —
+  a recreate still makes zero external calls.
 
 ## Troubleshooting
 
-- **"Address already in use"** — another process holds port 8377 or 8378. Use
-  `--port` on either service; if you move them, also pass
-  `--triage-url http://127.0.0.1:<port>/triage` to the monitor and
-  `--webhook http://127.0.0.1:<port>/webhook` to the driver.
-- **Driver prints "webhook delivery failed"** — the monitor isn't running, or
-  is on a different port than the driver expects.
-- **Cards show `triage_error`** — the monitor is up but the triage service
-  isn't; start terminal 1 and re-fire the event.
-- **Dashboard doesn't update** — it auto-refreshes every 3 s; force-reload
-  once if your browser cached an old page.
+- **Can't reach 5544/6380 from Windows** — WSL2 localhost forwarding; run
+  `wsl -d Ubuntu -- bash infra/stack.sh status`; if the distro was shut down, `… up`.
+- **`alembic`/DB errors** — confirm `DATABASE_URL` (default
+  `postgresql+psycopg://repomon@127.0.0.1:5544/repomon`) and that the stack is up.
+- **Recreate button shows an error** — the datastores or `blackduck.local.json` aren't
+  available; the message is shown inline next to the button.
