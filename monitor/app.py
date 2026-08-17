@@ -436,13 +436,15 @@ class ProjectState:
                                     "error": repr(exc), "at": now_iso()}
 
     # ----------------------------------------------------------- check for updates (fetch)
-    def run_update(self) -> None:
+    def run_update(self, component=None) -> None:
         """Fetch new commits since the cursor (local git) and show them ALL — already
         triaged ones from cache, the rest yellow/untriaged. Cache-only, so NO tokens;
-        triage is the separate Fill button. Advances the cursor, so a re-check is 0 new."""
+        triage is the separate Fill button. Advances the cursor, so a re-check is 0 new.
+        component=None fetches every watched repo; else just that one."""
         try:
             from provisioning import updater
-            res = updater.fetch_updates(self.project, self.watches, "all", None)
+            watches = [w for w in self.watches if component is None or w["component"] == component]
+            res = updater.fetch_updates(self.project, watches, "all", None)
             self._fire_events(res["events"], cache_only=True)          # 0 tokens
             existing = self._load_events()
             seen = {e.get("commit") for e in existing}
@@ -451,37 +453,43 @@ class ProjectState:
             untri = sum(1 for r in self.results if _event_label(r) == "untriaged")
             self.update_status = {"state": "done", "error": None, "at": now_iso(),
                                   "summary": {"added": res["processed"], "untriaged": untri,
+                                              "scope": component or "all repos",
                                               "warnings": res.get("warnings", [])}}
         except Exception as exc:
             self.update_status = {"state": "error", "summary": None, "error": repr(exc),
                                   "at": now_iso()}
 
     # ----------------------------------------------------------- fill missing triage (tokens)
-    def run_fill(self, mode=None, limit=None) -> None:
+    def run_fill(self, mode=None, limit=None, component=None) -> None:
         """Triage the untriaged (yellow) commits — the ONLY token-spending action.
         mode=None counts and auto-runs under the threshold, else parks in 'preview';
-        mode 'all'/'latest' triages the chosen set (newest-first)."""
+        mode 'all'/'latest' triages the chosen set (newest-first). component=None triages
+        every repo's untriaged; else just that one."""
         try:
             from provisioning.updater import THRESHOLD
-            untriaged = [r for r in self.results if _event_label(r) == "untriaged"]
+            untriaged = [r for r in self.results if _event_label(r) == "untriaged"
+                         and (component is None or r.get("component") == component)]
             if mode is None:
                 if not untriaged:
                     self.fill_status = {"state": "done", "preview": None, "error": None,
-                                        "at": now_iso(), "summary": {"message": "nothing to triage"}}
+                                        "at": now_iso(),
+                                        "summary": {"message": "nothing to triage",
+                                                    "scope": component or "all repos"}}
                 elif len(untriaged) <= THRESHOLD:
-                    self._apply_fill(untriaged)
+                    self._apply_fill(untriaged, component)
                 else:
                     self.fill_status = {"state": "preview", "summary": None, "error": None,
                                         "at": now_iso(),
-                                        "preview": {"total": len(untriaged), "threshold": THRESHOLD}}
+                                        "preview": {"total": len(untriaged), "threshold": THRESHOLD,
+                                                    "component": component}}
             else:
                 chosen = untriaged[:limit] if (mode == "latest" and limit) else untriaged
-                self._apply_fill(chosen)
+                self._apply_fill(chosen, component)
         except Exception as exc:
             self.fill_status = {"state": "error", "preview": None, "summary": None,
                                 "error": repr(exc), "at": now_iso()}
 
-    def _apply_fill(self, results) -> None:
+    def _apply_fill(self, results, component=None) -> None:
         stats = {"triaged": 0, "live_calls": 0, "cache_hits": 0, "tokens_in": 0, "tokens_out": 0}
         for r in results:
             watch = self.watch_by_component.get(r.get("component"))
@@ -502,6 +510,7 @@ class ProjectState:
                 stats["tokens_out"] += u.get("output_tokens") or 0
             elif src == "claude-cache":
                 stats["cache_hits"] += 1
+        stats["scope"] = component or "all repos"
         self.fill_status = {"state": "done", "preview": None, "error": None, "at": now_iso(),
                             "summary": stats}
 
@@ -720,11 +729,13 @@ def render_project(reg: Registry, ps: ProjectState, status_filter: str = None) -
                   f"<code>{esc(bf)}{refpart}</code>{warn}</span>")
         return u
 
-    def _rows(ws):
+    def _rows(ws, actions=False):
         return "".join(
             f"<tr><td>{esc(w['component'])}</td><td>{_url(w)}</td>"
             f"<td>{esc(w['relationship'])}</td><td>{esc(', '.join(w['provenance']))}</td>"
-            f"<td>{_pin(w)}</td><td>{_watch(w)}</td></tr>"
+            f"<td>{_pin(w)}</td><td>{_watch(w)}</td>"
+            + (f"<td>{_repo_actions(w)}</td>" if actions else "")
+            + "</tr>"
             for w in ws)
 
     mon = [w for w in ps.watches if w.get("monitored", True)]
@@ -794,6 +805,23 @@ def render_project(reg: Registry, ps: ProjectState, status_filter: str = None) -
     active = set(status_filter.split(",")) if status_filter else None
     counts = Counter(_event_label(r) for r in ps.results)
     filtered = [r for r in ps.results if active is None or _event_label(r) in active]
+    untri_by_comp = Counter(r.get("component") for r in ps.results
+                            if _event_label(r) == "untriaged")
+
+    def _repo_actions(w):
+        comp = w["component"]
+        n = untri_by_comp.get(comp, 0)
+        upd = (f"<button title='fetch new commits for {esc(comp)}' onclick=\"this.disabled=true;"
+               f"fetch('/update?project={quote(ps.name)}&component={quote(comp)}',{{method:'POST'}})"
+               f".then(()=>setTimeout(()=>location.reload(),600))\" style='background:#1F6F78;"
+               f"color:#fff;border:0;border-radius:3px;padding:2px 7px;cursor:pointer;font-size:11px;"
+               f"margin-right:3px'>&#x21bb; updates</button>")
+        fil = (f"<button title='fill triage for {esc(comp)}' onclick=\"this.disabled=true;"
+               f"fetch('/fill?project={quote(ps.name)}&component={quote(comp)}',{{method:'POST'}})"
+               f".then(()=>setTimeout(()=>location.reload(),600))\" style='background:#8E44AD;"
+               f"color:#fff;border:0;border-radius:3px;padding:2px 7px;cursor:pointer;font-size:11px'>"
+               f"&#x2699; fill {n}</button>")
+        return upd + fil
 
     def _toggle_href(label):
         cur = set(active) if active else set()
@@ -879,8 +907,8 @@ def render_project(reg: Registry, ps: ProjectState, status_filter: str = None) -
         ust = "<span style='color:#B9770E'>fetching new upstream commits&hellip;</span>"
     elif us["state"] == "done":
         s = us["summary"] or {}
-        ust = (f"<span style='color:#2E7D32'>added {s.get('added', 0)} new commit(s) "
-               f"&middot; {s.get('untriaged', 0)} untriaged</span>")
+        ust = (f"<span style='color:#2E7D32'>[{esc(s.get('scope', 'all repos'))}] added "
+               f"{s.get('added', 0)} new commit(s) &middot; {s.get('untriaged', 0)} untriaged</span>")
         if s.get("warnings"):
             ust += f" <span style='color:#B9770E'>&middot; {esc('; '.join(s['warnings']))}</span>"
     elif us["state"] == "error":
@@ -902,18 +930,22 @@ def render_project(reg: Registry, ps: ProjectState, status_filter: str = None) -
     elif fs["state"] == "preview":
         p = fs["preview"] or {}
         thr = p.get("threshold", 100)
-        fst = (f"<div style='margin-top:6px;color:#C0392B'><b>{p.get('total')} untriaged</b> commits "
-               f"&mdash; this spends Claude tokens. "
-               + _fbtn(f"Triage all {p.get('total')}", "&amp;mode=all", "#C0392B")
-               + _fbtn(f"Only latest {thr}", f"&amp;mode=latest&amp;limit={thr}", "#B9770E")
+        comp = p.get("component")
+        cq = f"&amp;component={quote(comp)}" if comp else ""
+        scope = f" for {esc(comp)}" if comp else ""
+        fst = (f"<div style='margin-top:6px;color:#C0392B'><b>{p.get('total')} untriaged</b> commits"
+               f"{scope} &mdash; this spends Claude tokens. "
+               + _fbtn(f"Triage all {p.get('total')}", f"&amp;mode=all{cq}", "#C0392B")
+               + _fbtn(f"Only latest {thr}", f"&amp;mode=latest&amp;limit={thr}{cq}", "#B9770E")
                + _fbtn("Cancel", "&amp;mode=cancel", "#7F8C8D") + "</div>")
     elif fs["state"] == "done":
         s = fs["summary"] or {}
+        sc = f"[{esc(s.get('scope', 'all repos'))}] "
         if s.get("message"):
-            fst = f"<span style='color:#2E7D32'>{esc(s['message'])}</span>"
+            fst = f"<span style='color:#2E7D32'>{sc}{esc(s['message'])}</span>"
         else:
             tk = (s.get("tokens_in", 0) or 0) + (s.get("tokens_out", 0) or 0)
-            fst = (f"<span style='color:#2E7D32'>triaged {s.get('triaged', 0)} "
+            fst = (f"<span style='color:#2E7D32'>{sc}triaged {s.get('triaged', 0)} "
                    f"&middot; {s.get('live_calls', 0)} Claude call(s)"
                    + (f" ~{tk // 1000}k tok" if tk else "")
                    + (f" &middot; {s['cache_hits']} cached" if s.get("cache_hits") else "") + "</span>")
@@ -932,8 +964,8 @@ def render_project(reg: Registry, ps: ProjectState, status_filter: str = None) -
 <p>{fill_html}</p>
 <p class="muted" style="font-size:13px"><b>Precision funnel:</b> {funnel}</p>
 <h2>Monitored repos ({len(mon)})</h2>
-<table><tr><th>Component</th><th>VCS URL</th><th>Relationship</th><th>Provenance</th><th>Pinned ref</th><th>Watches (branch)</th></tr>
-{_rows(mon)}</table>
+<table><tr><th>Component</th><th>VCS URL</th><th>Relationship</th><th>Provenance</th><th>Pinned ref</th><th>Watches (branch)</th><th>Actions</th></tr>
+{_rows(mon, actions=True)}</table>
 {ref_section}
 <h2>Commit events ({len(filtered)}{f' of {len(ps.results)}' if active else ''})</h2>
 {filter_bar}
@@ -1050,9 +1082,11 @@ class MonitorHandler(BaseHTTPRequestHandler):
             return
 
         # UI action: fetch new upstream commits since the cursor (cache-only, no tokens).
+        # Optional &component scopes it to one monitored repo; else all.
         if parsed.path == "/update":
             qs = parse_qs(parsed.query)
             project = unquote(qs["project"][0]) if "project" in qs else None
+            component = unquote(qs["component"][0]) if "component" in qs else None
             ps = self.reg.projects.get(project)
             if ps is None:
                 self._send_json(404, {"error": f"unknown project {project}"})
@@ -1063,14 +1097,17 @@ class MonitorHandler(BaseHTTPRequestHandler):
                     return
                 ps.update_status = {"state": "running", "summary": None, "error": None,
                                     "at": now_iso()}
-            threading.Thread(target=ps.run_update, daemon=True).start()
+            threading.Thread(target=ps.run_update, kwargs={"component": component},
+                             daemon=True).start()
             self._send_json(202, {"status": "started"})
             return
 
         # UI action: fill missing triage (the ONLY token-spending action) — confirm > threshold.
+        # Optional &component scopes it to one monitored repo; else all.
         if parsed.path == "/fill":
             qs = parse_qs(parsed.query)
             project = unquote(qs["project"][0]) if "project" in qs else None
+            component = unquote(qs["component"][0]) if "component" in qs else None
             ps = self.reg.projects.get(project)
             if ps is None:
                 self._send_json(404, {"error": f"unknown project {project}"})
@@ -1089,7 +1126,8 @@ class MonitorHandler(BaseHTTPRequestHandler):
                 ps.fill_status = {"state": ("counting" if mode is None else "running"),
                                   "preview": ps.fill_status.get("preview"), "summary": None,
                                   "error": None, "at": now_iso()}
-            threading.Thread(target=ps.run_fill, kwargs={"mode": mode, "limit": limit},
+            threading.Thread(target=ps.run_fill,
+                             kwargs={"mode": mode, "limit": limit, "component": component},
                              daemon=True).start()
             self._send_json(202, {"status": "started", "mode": mode})
             return
