@@ -371,6 +371,11 @@ _STYLE = """
  .rationale { font-size: 13px; margin-top: 6px; }
  .pill { display:inline-block; min-width:18px; text-align:center; padding:1px 7px;
          border-radius:10px; font-size:12px; color:white; }
+ details.changed { margin-top: 6px; font-size: 12px; }
+ details.changed summary { cursor: pointer; color: #582C83; user-select: none; }
+ details.changed ul { margin: 4px 0 0 0; padding-left: 18px; list-style: none; }
+ details.changed li { margin: 1px 0; }
+ .inscope-tag { color: #B9770E; font-size: 11px; margin-left: 6px; }
 """
 
 
@@ -468,12 +473,32 @@ def render_project(reg: Registry, ps: ProjectState) -> bytes:
         status = r["status"]
         verdict = (r.get("triage") or {}).get("verdict")
         color = {"response_required": "#C0392B", "needs_human_review": "#B9770E",
-                 "not_meaningful": "#7F8C8D"}.get(verdict) or \
+                 "not_meaningful": "#66BB6A"}.get(verdict) or \
                 {"suppressed": "#2E7D32", "ignored": "#7F8C8D",
                  "not_monitored": "#5D6D7E", "triage_error": "#C0392B"}.get(status, "#34495E")
         label = verdict or status
-        files = ", ".join(f"<code>{esc(m['path'])}</code> (tier {m['tier']})"
-                          for m in r.get("in_scope", [])) or "—"
+
+        # In-scope files (the compiled ones the relevance filter matched).
+        in_scope = r.get("in_scope", [])
+        in_scope_paths = {m["path"] for m in in_scope}
+        scope_html = ""
+        if in_scope:
+            files = ", ".join(f"<code>{esc(m['path'])}</code> (tier {m['tier']})" for m in in_scope)
+            scope_html = f"<div class='muted'>in scope: {files}</div>"
+
+        # Every commit's actual changed files, in a collapsible disclosure — so a
+        # suppressed/not-monitored commit is readable, not just a bare dash. Files
+        # that matched the compiled set are tagged.
+        changed = r.get("files_changed") or []
+        changed_html = ""
+        if changed:
+            lis = "".join(
+                f"<li><code>{esc(p)}</code>"
+                f"{'<span class=inscope-tag>● in scope</span>' if p in in_scope_paths else ''}</li>"
+                for p in changed)
+            changed_html = (f"<details class='changed'><summary>{len(changed)} changed "
+                            f"file{'s' if len(changed) != 1 else ''}</summary><ul>{lis}</ul></details>")
+
         rationale = esc((r.get("triage") or {}).get("rationale", r.get("reason", "")))
         cross_html = ""
         cross = r.get("cross_repo") or []
@@ -491,8 +516,8 @@ def render_project(reg: Registry, ps: ProjectState) -> bytes:
             f"<b>{esc(r.get('component', r.get('repo', '?')))}</b> "
             f"<code>{esc(str(r.get('commit', r.get('commits', '?'))))[:16]}</code> "
             f"<span class='muted'>{esc(r.get('ref', ''))} · {esc(r['received_at'])}</span></div>"
-            f"<div class='muted'>in scope: {files}</div>"
-            f"<div class='rationale'>{rationale}</div>{cross_html}</div>")
+            f"{scope_html}"
+            f"<div class='rationale'>{rationale}</div>{cross_html}{changed_html}</div>")
 
     cards = "".join(result_card(r) for r in ps.results) or \
         "<p class='muted'>No commit events received yet for this project.</p>"
