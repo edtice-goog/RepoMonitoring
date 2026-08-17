@@ -30,6 +30,7 @@ import sys
 import threading
 import urllib.error
 import urllib.request
+from collections import Counter
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -490,7 +491,25 @@ watched repositories and the upstream commit events being triaged. Triage backen
     return _page("RepoMonitoring — projects", body)
 
 
-def render_project(reg: Registry, ps: ProjectState) -> bytes:
+_LABEL_COLOR = {
+    "response_required": "#C0392B", "needs_human_review": "#B9770E",
+    "not_meaningful": "#66BB6A", "suppressed": "#2E7D32",
+    "not_monitored": "#5D6D7E", "ignored": "#7F8C8D", "triage_error": "#C0392B",
+}
+_ACTIONABLE = ("response_required", "needs_human_review")
+
+
+def _event_label(r):
+    """The single status label an event is filtered/coloured by: the triage verdict
+    when triaged, else the pipeline status (suppressed / not_monitored / ...)."""
+    return (r.get("triage") or {}).get("verdict") or r.get("status", "?")
+
+
+def _label_color(label):
+    return _LABEL_COLOR.get(label, "#34495E")
+
+
+def render_project(reg: Registry, ps: ProjectState, status_filter: str = None) -> bytes:
     def _pin(w):
         ref = (f"<code title='Immutable file-scope ref — the exact snapshot we "
                f"enumerated files at'>{esc(w['pinned_ref'] or '—')}</code>")
@@ -546,13 +565,8 @@ def render_project(reg: Registry, ps: ProjectState) -> bytes:
             f"{_rows(ref)}</table>")
 
     def result_card(r):
-        status = r["status"]
-        verdict = (r.get("triage") or {}).get("verdict")
-        color = {"response_required": "#C0392B", "needs_human_review": "#B9770E",
-                 "not_meaningful": "#66BB6A"}.get(verdict) or \
-                {"suppressed": "#2E7D32", "ignored": "#7F8C8D",
-                 "not_monitored": "#5D6D7E", "triage_error": "#C0392B"}.get(status, "#34495E")
-        label = verdict or status
+        label = _event_label(r)
+        color = _label_color(label)
 
         # In-scope files (the compiled ones the relevance filter matched).
         in_scope = r.get("in_scope", [])
@@ -595,8 +609,43 @@ def render_project(reg: Registry, ps: ProjectState) -> bytes:
             f"{scope_html}"
             f"<div class='rationale'>{rationale}</div>{cross_html}{changed_html}</div>")
 
-    cards = "".join(result_card(r) for r in ps.results) or \
-        "<p class='muted'>No commit events received yet for this project.</p>"
+    # Status filter (URL param, so it survives the 3 s auto-refresh). A handful of
+    # 100 events are actionable; let the user hide the noise.
+    active = set(status_filter.split(",")) if status_filter else None
+    counts = Counter(_event_label(r) for r in ps.results)
+    filtered = [r for r in ps.results if active is None or _event_label(r) in active]
+
+    def _toggle_href(label):
+        cur = set(active) if active else set()
+        new = {label} if active is None else (cur - {label} if label in cur else cur | {label})
+        if not new:
+            return f"/?project={quote(ps.name)}"
+        return f"/?project={quote(ps.name)}&status={quote(','.join(sorted(new)))}"
+
+    def _chip(label, count, href, on):
+        c = _label_color(label)
+        style = f"background:{c};color:#fff" if on else f"background:#eee;color:{c};opacity:.55"
+        return (f"<a href='{href}' style='text-decoration:none;{style};padding:2px 9px;"
+                f"border-radius:11px;font-size:12px;margin:0 5px 5px 0;display:inline-block'>"
+                f"{esc(label)} {count}</a>")
+
+    filter_bar = ""
+    if ps.results:
+        order = ([l for l in _LABEL_COLOR if l in counts]
+                 + [l for l in counts if l not in _LABEL_COLOR])
+        chip_html = "".join(_chip(l, counts[l], _toggle_href(l), active is None or l in active)
+                            for l in order)
+        all_href = f"/?project={quote(ps.name)}"
+        act_href = f"/?project={quote(ps.name)}&status={quote(','.join(_ACTIONABLE))}"
+        filter_bar = (f"<div style='margin:8px 0'>{chip_html}"
+                      f"<a href='{all_href}' style='font-size:12px;margin-left:6px'>all</a> &middot; "
+                      f"<a href='{act_href}' style='font-size:12px'>actionable</a></div>")
+
+    if not ps.results:
+        cards = "<p class='muted'>No commit events received yet for this project.</p>"
+    else:
+        cards = "".join(result_card(r) for r in filtered) or \
+            "<p class='muted'>No events match this filter.</p>"
 
     rs = ps.recreate_status
     if rs["state"] == "running":
@@ -660,7 +709,8 @@ def render_project(reg: Registry, ps: ProjectState) -> bytes:
 <table><tr><th>Component</th><th>VCS URL</th><th>Relationship</th><th>Provenance</th><th>Pinned ref</th><th>Watches (branch)</th></tr>
 {_rows(mon)}</table>
 {ref_section}
-<h2>Commit events ({len(ps.results)})</h2>
+<h2>Commit events ({len(filtered)}{f' of {len(ps.results)}' if active else ''})</h2>
+{filter_bar}
 {cards}"""
     return _page(f"RepoMonitoring — {ps.name}", body)
 
@@ -690,7 +740,9 @@ class MonitorHandler(BaseHTTPRequestHandler):
                 if ps is None:
                     self._send_json(404, {"error": f"unknown project {project}"})
                 else:
-                    self._send(200, render_project(self.reg, ps), "text/html; charset=utf-8")
+                    status = unquote(qs["status"][0]) if "status" in qs else None
+                    self._send(200, render_project(self.reg, ps, status),
+                               "text/html; charset=utf-8")
             else:
                 self._send(200, render_project_list(self.reg), "text/html; charset=utf-8")
         elif parsed.path == "/health":
