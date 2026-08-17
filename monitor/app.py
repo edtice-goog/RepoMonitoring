@@ -669,6 +669,41 @@ class Registry:
             self.add_status = {"state": "error", "message": None, "error": repr(exc),
                                "at": now_iso()}
 
+    def ingest_and_load(self, payload: dict) -> dict:
+        """Remote ingestion entry point. Persist a posted seed payload to Postgres
+        SYNCHRONOUSLY (so the client's POST returns only once the DB write succeeded),
+        then recreate the project's artifacts + load it live in the BACKGROUND. Nothing
+        here reads the build box's filesystem — the payload carries the whole seed set.
+        Returns the persist summary; recreate+load progress lands in add_status."""
+        from provisioning.ingest_service import persist_ingest
+        from gh_replay import GH, gh_token
+        summary = persist_ingest(payload, GH(gh_token()))       # raises IngestError -> 400
+        name = summary["project"]
+        threading.Thread(target=self._recreate_and_add,
+                         args=(name, bool(payload.get("reset_feed"))), daemon=True).start()
+        return summary
+
+    def _recreate_and_add(self, name, reset_feed=False):
+        """Background: recreate a freshly-ingested project's artifacts from the DB seeds
+        + cache, then load/reload it live. Recreates INTO the project's existing data dir
+        when it is already loaded, else the conventional live-<slug>."""
+        try:
+            import re
+            from provisioning.recreate import recreate_project
+            existing = next((ps for ps in self.projects.values() if ps.project == name), None)
+            if existing is not None:
+                out_dir = existing.data_dir
+            else:
+                slug = re.sub(r"[^a-z0-9._-]+", "-", name.lower()).strip("-")
+                out_dir = REPO_ROOT / f"live-{slug}"
+            self.add_status = {"state": "running", "message": f"recreating {name}",
+                               "error": None, "at": now_iso()}
+            recreate_project(name, out_dir, reset_feed=reset_feed, log=lambda m: None)
+            self.run_add(name, out_dir)                         # sets add_status done + remembers
+        except Exception as exc:
+            self.add_status = {"state": "error", "message": None, "error": repr(exc),
+                               "at": now_iso()}
+
     def process_push(self, payload: dict) -> dict:
         repo_url = (payload.get("repository") or {}).get("clone_url") \
             or (payload.get("repository") or {}).get("url") or ""
@@ -1100,6 +1135,28 @@ class MonitorHandler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:
         parsed = urlparse(self.path)
+
+        # API (called by the build-box ingest client): persist a posted seed payload to
+        # Postgres, then recreate + load the project. The build box shares NO filesystem
+        # with the monitor — everything needed is in the body. The SBoM is NOT sent; it is
+        # reloaded from the BD link and cached. Persist is synchronous; recreate+load runs
+        # in the background (poll GET /api/db-projects -> add_status).
+        if parsed.path == "/projects/ingest":
+            try:
+                length = int(self.headers.get("Content-Length", 0))
+                payload = json.loads(self.rfile.read(length))
+            except (ValueError, json.JSONDecodeError):
+                self._send_json(400, {"error": "body must be valid JSON"})
+                return
+            try:
+                summary = self.reg.ingest_and_load(payload)
+            except Exception as exc:
+                from provisioning.ingest_service import IngestError
+                code = 400 if isinstance(exc, IngestError) else 500
+                self._send_json(code, {"error": str(exc), "type": type(exc).__name__})
+                return
+            self._send_json(200, {"status": "ingested", "recreate": "started", **summary})
+            return
 
         # API (called by the analysis script): register an already-recreated project's
         # data dir into the running monitor — no restart. Reloads if already loaded.

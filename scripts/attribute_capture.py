@@ -45,13 +45,15 @@ from bd_provision import (resolve_project_version, component_context,   # noqa: 
                           enhance_with_claude, build_anthropic_client)
 from gh_replay import GH, gh_token, parse_owner_repo   # noqa: E402
 import repo_mapper                                     # noqa: E402
+# Pure-stdlib local collection lives in emit_local (so a build box can import it without
+# the heavy deps above). Re-exported here to keep the server pipeline's import surface.
+from emit_local import (SRC_EXT, HDR_EXT, DEFAULT_EMIT, _is_scaffolding,  # noqa: E402,F401
+                        parse_emit, digest_tails, norm_repo, slugify, _git,
+                        files_payload, collect_checkouts_local)
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
-DEFAULT_EMIT = Path(r"C:\Data\repo-monitoring-workspace\bdcpp-output\cov_emit_links.json")
 DEFAULT_DIR = REPO_ROOT / "live-stage3"
 MODEL = "claude-opus-4-6"
-SRC_EXT = (".c", ".cc", ".cpp", ".cxx")
-HDR_EXT = (".h", ".hpp", ".hh", ".hxx")
 
 SYSTEM_FROMFILES = """\
 You are reconstructing a software Bill of Materials from a list of source and \
@@ -70,42 +72,8 @@ List only libraries/software actually compiled or linked into the product."""
 BUILD_TOOLS = {"cmake", "ninja", "make", "gnu make", "meson", "autoconf",
                "automake", "gcc", "clang", "llvm", "msvc", "coverity"}
 
-
-def _is_scaffolding(path: str) -> bool:
-    p = path.replace("\\", "/").lower()
-    return "/cmakefiles/" in p or "/compilerid" in p
-
-
-def parse_emit(emit_path: Path):
-    d = json.loads(emit_path.read_text(encoding="utf-8"))
-    id2path = {f["id"]: (f.get("case-preserved") or f.get("case-normalized") or "")
-               for f in d.get("files", []) if isinstance(f, dict) and "id" in f}
-    primaries, all_compiled = set(), set()
-    for tu in d.get("translation-units", []):
-        prim = id2path.get(tu.get("primary-file-id"), "")
-        if prim.lower().endswith(SRC_EXT) and not _is_scaffolding(prim):
-            primaries.add(prim)
-        for inf in tu.get("input-files", []):
-            p = id2path.get(inf.get("file-id"), "")
-            if p.lower().endswith(SRC_EXT + HDR_EXT) and not _is_scaffolding(p):
-                all_compiled.add(p)
-    return primaries, all_compiled
-
-
-def digest_tails(paths, depth=5, cap=500):
-    tails = set()
-    for p in paths:
-        segs = [s for s in p.replace("\\", "/").split("/") if s]
-        tails.add("/".join(segs[-depth:]))
-    return sorted(tails)[:cap]
-
-
-def norm_repo(url):
-    return re.sub(r"^https?://", "", (url or "").strip().lower()).rstrip("/").removesuffix(".git")
-
-
-def slugify(name):
-    return name.lower().replace(" ", "-")
+# parse_emit / digest_tails / norm_repo / slugify / _is_scaffolding / _git and the file
+# extension sets are imported from emit_local (above) — the stdlib-only build-box surface.
 
 
 # --------------------------------------------------------------- Claude-from-files
@@ -135,12 +103,22 @@ def claude_from_files(cfg, tails):
 
 
 # --------------------------------------------------------------- .git discovery
-def _git(root, *args):
-    try:
-        return subprocess.check_output(["git", "-C", root, *args],
-                                       text=True, stderr=subprocess.DEVNULL).strip()
-    except Exception:
-        return None
+# (_git is imported from emit_local.)
+def fork_parent(gh, url):
+    """Resolve a checkout's origin URL to its canonical upstream: if it's a GitHub fork,
+    the fork-parent (the repo that matters); otherwise the URL unchanged. This is the one
+    NETWORK step of provenance discovery, kept server-side so the build box needs no
+    GitHub token — ingest_service calls it while enriching the posted checkouts."""
+    can, (owner, repo) = url, parse_owner_repo(url)
+    if owner:
+        try:
+            info = gh.get(f"/repos/{owner}/{repo}")
+            par = info.get("parent") or info.get("source") or {}
+            if par.get("full_name"):
+                can = f"https://github.com/{par['full_name']}"
+        except Exception:
+            pass
+    return can
 
 
 def discover_git(gh, paths):
@@ -183,19 +161,9 @@ def discover_git(gh, paths):
         return ref_cache[root]
 
     def canonical(url):
-        if url in canon_cache:
-            return canon_cache[url]
-        can, (owner, repo) = url, parse_owner_repo(url)
-        if owner:
-            try:
-                info = gh.get(f"/repos/{owner}/{repo}")
-                par = info.get("parent") or info.get("source") or {}
-                if par.get("full_name"):
-                    can = f"https://github.com/{par['full_name']}"
-            except Exception:
-                pass
-        canon_cache[url] = can
-        return can
+        if url not in canon_cache:
+            canon_cache[url] = fork_parent(gh, url)
+        return canon_cache[url]
 
     git_attr, checkouts = {}, {}
     for p in paths:
