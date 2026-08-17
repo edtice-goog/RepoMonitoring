@@ -15,5 +15,8 @@ blackduck.local.json
 live*/
 .venv/
 
+# Service logs + pidfiles from infra/serve.ps1
+logs/
+
 __pycache__/
 *.pyc

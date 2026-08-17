@@ -67,9 +67,28 @@ python provisioning/recreate.py --project repo-mon-stage3-curl --out-dir live-st
 
 ## Run the demo
 
-Three terminals (datastores already up from setup):
+### Start everything (one command)
+
+`infra/serve.ps1` brings up the WSL2 datastores, the triage service, and the monitor
+(background processes; logs under `logs/`):
+
+```powershell
+./infra/serve.ps1 up                 # datastores + triage + monitor
+./infra/serve.ps1 up -CacheOnly      # keyless triage (offline, from cache)
+./infra/serve.ps1 status
+./infra/serve.ps1 down               # stop services (datastores persist; -IncludeDatastores to stop them too)
+```
+
+Then fire the saved commit events:
 
 ```bash
+python driver/replay.py --events live-stage3/repo-mon-stage3-curl-commit-events.json --all
+```
+
+### Or start each service by hand
+
+```bash
+wsl -d Ubuntu -- bash infra/stack.sh up           # datastores
 python triage-service/claude_server.py            # or --cache-only for keyless replay
 python monitor/app.py --data-dir live-stage3
 python driver/replay.py --events live-stage3/repo-mon-stage3-curl-commit-events.json --all
