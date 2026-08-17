@@ -236,36 +236,18 @@ def recreate_project(name, out_dir, refresh_sbom=False, refresh_events=False,
         "project": name, "version": bd_version, "totalCount": len(items), "items": items},
         indent=2), encoding="utf-8")
 
-    # ---------- (8) replay events on the watch branches (cached) ----------
-    all_events = []
-    for cand in candidates.values():
-        owner, repo = parse_owner_repo(cand["vcs_url"])
-        branch = cand.get("watch_ref")
-        if not owner or not branch:
-            continue
-
-        def commits_producer(o=owner, r=repo, b=branch, sl=cand["slug"]):
-            try:
-                return fetch_commits(_gh(), o, r, b, commits, sl)
-            except Exception as exc:
-                warnings.append(f"{sl}: commit fetch failed on {b} ({exc})")
-                return []
-        evs = cache.cached("commits", {"repo": f"{owner}/{repo}", "branch": branch, "n": commits},
-                           commits_producer, refresh=refresh_events)
-        all_events.extend(evs)
-
-    events_name = f"{name}-commit-events.json"
-    (out_dir / events_name).write_text(json.dumps({
-        "_comment": "Recreated upstream commit events (cached).", "events": all_events},
-        indent=2), encoding="utf-8")
+    # Events are NOT fetched here — recreate rebuilds the MANIFEST only. Upstream
+    # commit events are owned by the 'check for updates' backfill + the durable events
+    # file, and replayed from cache (the monitor's Replay button / auto-replay after a
+    # recreate). That is why a recreate spends nothing on events.
 
     summary = {
         "project": name, "monitored": monitored,
         "reference_only": sorted(c["slug"] for c in candidates.values() if c["slug"] not in monitored),
-        "components": len(candidates), "events": len(all_events),
+        "components": len(candidates),
         "external_calls": cache.external_calls(),
         "misses": dict(cache.STATS["miss"]), "hits": dict(cache.STATS["hit"]),
-        "warnings": warnings, "out_dir": str(out_dir), "events_name": events_name}
+        "warnings": warnings, "out_dir": str(out_dir)}
     for w in warnings:
         log(f"[warn] {w}")
     log(f"[done] external_calls={summary['external_calls']} misses={summary['misses']} "

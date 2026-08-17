@@ -171,8 +171,9 @@ def count_pending(project_name, watches):
 
 def fetch_updates(project_name, watches, mode, limit=None):
     """mode 'all' = every commit since base (capped at MAX_BACKFILL); 'latest' = the
-    newest `limit`. Returns webhook payloads (oldest-first) + cursor advances."""
-    payloads, advances, processed, warnings = [], [], 0, []
+    newest `limit`. Returns commit EVENTS (oldest-first, same shape the events file /
+    driver use) + the cursor advances to persist after firing."""
+    events, advances, processed, warnings = [], [], 0, []
     for r in _repos(watches):
         try:
             clone = ensure_clone(r["url"])
@@ -190,11 +191,12 @@ def fetch_updates(project_name, watches, mode, limit=None):
         chosen = commits[-limit:] if (mode == "latest" and limit) else commits[:MAX_BACKFILL]
         newest = chosen[-1]
         for c in chosen:                                # oldest-first
-            payloads.append({
-                "repository": {"clone_url": f"https://github.com/{r['owner']}/{r['repo']}"},
-                "ref": f"refs/heads/{r['branch']}",
-                "commits": [{"id": c["sha"], "message": c["subject"],
-                             "added": c["added"], "modified": c["modified"], "removed": c["removed"]}]})
+            events.append({
+                "id": f"{r['component']}-{c['sha'][:8]}",
+                "vcs_url": f"https://github.com/{r['owner']}/{r['repo']}",
+                "branch": r["branch"], "commit": c["sha"], "message": c["subject"],
+                "committed_at": c["date"],
+                "files_changed": c["added"] + c["modified"] + c["removed"]})
         advances.append((r["url"], newest["date"], newest["sha"]))
         processed += len(chosen)
-    return {"payloads": payloads, "advances": advances, "processed": processed, "warnings": warnings}
+    return {"events": events, "advances": advances, "processed": processed, "warnings": warnings}

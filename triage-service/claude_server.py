@@ -269,7 +269,8 @@ class ClaudeTriageHandler(BaseHTTPRequestHandler):
             print(f"[triage-claude] CACHE HIT  {commit[:12]}  verdict={entry['result']['verdict']}")
             self._send_json(200, {"commit": commit, "vcs_url": vcs_url,
                                   "files_evaluated": files, "cross_repo_locations": cross,
-                                  **entry["result"], "_triage_source": "claude-cache"})
+                                  **entry["result"], "usage": entry.get("usage"),
+                                  "_triage_source": "claude-cache"})
             return
 
         # ---- cache miss ----
@@ -307,7 +308,7 @@ class ClaudeTriageHandler(BaseHTTPRequestHandler):
               f"src={source}  tok={usage['input_tokens']}/{usage['output_tokens']}  -> cached")
         self._send_json(200, {"commit": commit, "vcs_url": vcs_url,
                               "files_evaluated": files, "cross_repo_locations": cross,
-                              **result, "_triage_source": "claude-live"})
+                              **result, "usage": usage, "_triage_source": "claude-live"})
 
     def log_message(self, fmt, *args):
         pass  # quiet; we print our own one-liners

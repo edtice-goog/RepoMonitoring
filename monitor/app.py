@@ -81,6 +81,9 @@ class ProjectState:
         self.update_status = {"state": "idle", "preview": None, "summary": None,
                               "error": None, "at": None}
         self.update_lock = threading.Lock()
+        self.replay_status = {"state": "idle", "summary": None, "error": None, "at": None}
+        self.replay_lock = threading.Lock()
+        self._seen = set()          # commit shas already surfaced (replay/update dedup)
         self._load()
 
     def reload(self) -> None:
@@ -91,6 +94,73 @@ class ProjectState:
         self.file_index = {}
         self.origin_index = {}
         self._load()
+
+    # ----------------------------------------------------------- event feed (replay)
+    def _events_path(self):
+        return self.data_dir / f"{self.project}-commit-events.json"
+
+    def _load_events(self):
+        p = self._events_path()
+        if p.exists():
+            try:
+                return json.loads(p.read_text(encoding="utf-8-sig")).get("events", [])
+            except (ValueError, OSError):
+                return []
+        return []
+
+    def _save_events(self, records):
+        self._events_path().write_text(json.dumps(
+            {"_comment": "Durable feed of surfaced upstream commit events; replayed from "
+                         "cache (no tokens). Extended by 'check for updates'.",
+             "events": records}, indent=2), encoding="utf-8")
+
+    @staticmethod
+    def _to_push(ev):
+        return {"ref": f"refs/heads/{ev.get('branch', '')}",
+                "repository": {"clone_url": ev["vcs_url"]},
+                "commits": [{"id": ev["commit"], "message": ev.get("message", ""),
+                             "added": [], "removed": [], "modified": ev.get("files_changed", [])}]}
+
+    def _fire_events(self, records):
+        """Fire event records through the webhook path, skipping already-seen commits,
+        and tally Claude spend (live calls vs cache hits) so the UI can prove a replay
+        costs nothing."""
+        stats = {"events": 0, "live_calls": 0, "cache_hits": 0, "tokens_in": 0, "tokens_out": 0}
+        for ev in records:
+            sha = ev.get("commit")
+            if sha and sha in self._seen:
+                continue
+            n0 = len(self.results)
+            self.process_push(self._to_push(ev))
+            for r in self.results[:len(self.results) - n0]:
+                if r.get("commit"):
+                    self._seen.add(r["commit"])
+                t = r.get("triage") or {}
+                src = t.get("_triage_source")
+                if src == "claude-live":
+                    stats["live_calls"] += 1
+                    u = t.get("usage") or {}
+                    stats["tokens_in"] += u.get("input_tokens") or 0
+                    stats["tokens_out"] += u.get("output_tokens") or 0
+                elif src == "claude-cache":
+                    stats["cache_hits"] += 1
+            stats["events"] += 1
+        return stats
+
+    def replay_events(self):
+        """Reset the feed and re-fire the durable events file (triage from cache -> 0
+        tokens). Restores 'current state' for free."""
+        self.results = []
+        self._seen = set()
+        return self._fire_events(self._load_events())
+
+    def run_replay(self):
+        try:
+            stats = self.replay_events()
+            self.replay_status = {"state": "done", "summary": stats, "error": None, "at": now_iso()}
+        except Exception as exc:
+            self.replay_status = {"state": "error", "summary": None, "error": repr(exc),
+                                  "at": now_iso()}
 
     def _load(self) -> None:
         capture = json.loads((self.data_dir / "build-capture.json").read_text(encoding="utf-8-sig"))
@@ -351,6 +421,7 @@ class ProjectState:
             summary = recreate_project(self.project, self.data_dir,
                                        refresh_sbom=refresh_sbom, log=lambda m: None)
             self.reload()
+            summary["replay"] = self.replay_events()   # restore the feed from cache (0 tokens)
             self.recreate_status = {"state": "done", "summary": summary,
                                     "error": None, "at": now_iso()}
         except Exception as exc:  # keep the server alive; surface the error in the UI
@@ -385,12 +456,14 @@ class ProjectState:
     def _apply_update(self, mode, limit) -> None:
         from provisioning import updater
         res = updater.fetch_updates(self.project, self.watches, mode, limit)
-        for payload in res["payloads"]:
-            self.process_push(payload)
+        stats = self._fire_events(res["events"])
+        # persist to the durable events file (dedup by sha) so Replay can restore them
+        existing = self._load_events()
+        seen = {e.get("commit") for e in existing}
+        self._save_events(existing + [e for e in res["events"] if e.get("commit") not in seen])
         updater.commit_advances(self.project, res["advances"])
         self.update_status = {"state": "done", "preview": None, "error": None, "at": now_iso(),
-                              "summary": {"processed": res["processed"],
-                                          "fired": len(res["payloads"]), "mode": mode}}
+                              "summary": {"processed": res["processed"], "mode": mode, **stats}}
 
     # ----------------------------------------------------------- summary
     def summary(self) -> dict:
@@ -507,6 +580,18 @@ def _event_label(r):
 
 def _label_color(label):
     return _LABEL_COLOR.get(label, "#34495E")
+
+
+def _tokline(s):
+    """Human token/cost summary for a replay/update action — proof of no repeat spend."""
+    if not s:
+        return ""
+    tk = (s.get("tokens_in", 0) or 0) + (s.get("tokens_out", 0) or 0)
+    parts = [f"{s.get('events', 0)} events",
+             f"{s.get('live_calls', 0)} Claude call(s)" + (f" ~{tk // 1000}k tok" if tk else "")]
+    if s.get("cache_hits"):
+        parts.append(f"{s['cache_hits']} cached")
+    return " &middot; ".join(parts)
 
 
 def render_project(reg: Registry, ps: ProjectState, status_filter: str = None) -> bytes:
@@ -655,6 +740,8 @@ def render_project(reg: Registry, ps: ProjectState, status_filter: str = None) -
         st = (f"<span style='color:#2E7D32'>last recreate {esc(rs['at'])}: "
               f"{s.get('external_calls', '?')} external call(s), monitored="
               f"{esc(s.get('monitored'))}</span>")
+        if s.get("replay"):
+            st += f" <span style='color:#2E7D32'>&middot; replayed {_tokline(s['replay'])}</span>"
         if (s.get("warnings") or []):
             st += f" <span style='color:#B9770E'>· {esc('; '.join(s['warnings']))}</span>"
     elif rs["state"] == "error":
@@ -666,6 +753,22 @@ def render_project(reg: Registry, ps: ProjectState, status_filter: str = None) -
         f"{{method:'POST'}}).then(()=>setTimeout(()=>location.reload(),500))\" "
         f"style='background:#582C83;color:#fff;border:0;border-radius:4px;padding:6px 12px;"
         f"cursor:pointer;font-size:13px'>&#x1F504; Recreate</button> <span style='font-size:12px'>{st}</span>")
+
+    # Replay: re-fire the durable events file from cache (no fetch, no tokens).
+    rp = ps.replay_status
+    replay_btn = (f"<button onclick=\"this.disabled=true;fetch('/replay?project={quote(ps.name)}',"
+                  f"{{method:'POST'}}).then(()=>setTimeout(()=>location.reload(),500))\" "
+                  f"style='background:#1F6F78;color:#fff;border:0;border-radius:4px;padding:6px 12px;"
+                  f"cursor:pointer;font-size:13px'>&#x25B6; Replay cached</button>")
+    if rp["state"] == "running":
+        rpt = "<span style='color:#B9770E'>replaying cached events&hellip;</span>"
+    elif rp["state"] == "done":
+        rpt = f"<span style='color:#2E7D32'>replayed {_tokline(rp['summary'])}</span>"
+    elif rp["state"] == "error":
+        rpt = f"<span style='color:#C0392B'>replay error: {esc(rp['error'])}</span>"
+    else:
+        rpt = "<span class='muted'>re-fire cached events (no new fetch, no tokens)</span>"
+    replay_html = f"{replay_btn} <span style='font-size:12px'>{rpt}</span>"
 
     # Check-for-updates: count new upstream commits since the cursor (or tag date),
     # warn over threshold, then backfill through the webhook path.
@@ -691,8 +794,8 @@ def render_project(reg: Registry, ps: ProjectState, status_filter: str = None) -
                + _ubtn("Cancel", "&amp;mode=cancel", "#7F8C8D") + "</div>")
     elif us["state"] == "done":
         s = us["summary"] or {}
-        msg = s.get("message") or f"processed {s.get('processed', 0)} new commit(s)"
-        ust = f"<span style='color:#2E7D32'>{esc(msg)}</span>"
+        ust = (f"<span style='color:#2E7D32'>{esc(s['message'])}</span>" if s.get("message")
+               else f"<span style='color:#2E7D32'>updated: {_tokline(s)}</span>")
     elif us["state"] == "error":
         ust = f"<span style='color:#C0392B'>update error: {esc(us['error'])}</span>"
     else:
@@ -703,6 +806,7 @@ def render_project(reg: Registry, ps: ProjectState, status_filter: str = None) -
 <p><a href="/">&larr; Projects</a></p>
 <h1>{esc(ps.name)} <span class="muted">({esc(ps.build_id)})</span></h1>
 <p>{recreate_html}</p>
+<p>{replay_html}</p>
 <p>{update_html}</p>
 <p class="muted" style="font-size:13px"><b>Precision funnel:</b> {funnel}</p>
 <h2>Monitored repos ({len(mon)})</h2>
@@ -780,6 +884,24 @@ class MonitorHandler(BaseHTTPRequestHandler):
                                       "error": None, "at": now_iso()}
             threading.Thread(target=ps.run_recreate, kwargs={"refresh_sbom": True},
                              daemon=True).start()
+            self._send_json(202, {"status": "started", "project": project})
+            return
+
+        # UI action: replay the durable events file from cache (no fetch, no tokens).
+        if parsed.path == "/replay":
+            qs = parse_qs(parsed.query)
+            project = unquote(qs["project"][0]) if "project" in qs else None
+            ps = self.reg.projects.get(project)
+            if ps is None:
+                self._send_json(404, {"error": f"unknown project {project}"})
+                return
+            with ps.replay_lock:
+                if ps.replay_status["state"] == "running":
+                    self._send_json(409, {"status": "busy"})
+                    return
+                ps.replay_status = {"state": "running", "summary": None, "error": None,
+                                    "at": now_iso()}
+            threading.Thread(target=ps.run_replay, daemon=True).start()
             self._send_json(202, {"status": "started", "project": project})
             return
 
