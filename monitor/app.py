@@ -78,11 +78,13 @@ class ProjectState:
         self.build_id = "?"
         self.recreate_status = {"state": "idle", "summary": None, "error": None, "at": None}
         self.recreate_lock = threading.Lock()
-        self.update_status = {"state": "idle", "preview": None, "summary": None,
-                              "error": None, "at": None}
+        self.update_status = {"state": "idle", "summary": None, "error": None, "at": None}
         self.update_lock = threading.Lock()
         self.replay_status = {"state": "idle", "summary": None, "error": None, "at": None}
         self.replay_lock = threading.Lock()
+        self.fill_status = {"state": "idle", "preview": None, "summary": None,
+                            "error": None, "at": None}
+        self.fill_lock = threading.Lock()
         self._seen = set()          # commit shas already surfaced (replay/update dedup)
         self._load()
 
@@ -432,42 +434,75 @@ class ProjectState:
             self.recreate_status = {"state": "error", "summary": None,
                                     "error": repr(exc), "at": now_iso()}
 
-    # ----------------------------------------------------------- check for updates
-    def run_update(self, mode=None, limit=None) -> None:
-        """Backfill/poll upstream commits since the last-seen cursor (or the built
-        tag date) and fire them through the webhook path. mode=None counts first and
-        either auto-processes (<= threshold) or parks in 'preview' for the user to
-        choose; mode 'all'/'latest' processes the chosen set."""
+    # ----------------------------------------------------------- check for updates (fetch)
+    def run_update(self) -> None:
+        """Fetch new commits since the cursor (local git) and show them ALL — already
+        triaged ones from cache, the rest yellow/untriaged. Cache-only, so NO tokens;
+        triage is the separate Fill button. Advances the cursor, so a re-check is 0 new."""
         try:
             from provisioning import updater
-            if mode is None:
-                plan = updater.count_pending(self.project, self.watches)
-                if plan["total"] == 0:
-                    self.update_status = {"state": "done", "preview": None, "error": None,
-                                          "at": now_iso(),
-                                          "summary": {"processed": 0, "message": "up to date"}}
-                elif plan["total"] <= plan["threshold"]:
-                    self._apply_update("all", None)
-                else:
-                    self.update_status = {"state": "preview", "preview": plan, "summary": None,
-                                          "error": None, "at": now_iso()}
-            else:
-                self._apply_update(mode, limit)
+            res = updater.fetch_updates(self.project, self.watches, "all", None)
+            self._fire_events(res["events"], cache_only=True)          # 0 tokens
+            existing = self._load_events()
+            seen = {e.get("commit") for e in existing}
+            self._save_events(existing + [e for e in res["events"] if e.get("commit") not in seen])
+            updater.commit_advances(self.project, res["advances"])
+            untri = sum(1 for r in self.results if _event_label(r) == "untriaged")
+            self.update_status = {"state": "done", "error": None, "at": now_iso(),
+                                  "summary": {"added": res["processed"], "untriaged": untri,
+                                              "warnings": res.get("warnings", [])}}
         except Exception as exc:
-            self.update_status = {"state": "error", "preview": None, "summary": None,
-                                  "error": repr(exc), "at": now_iso()}
+            self.update_status = {"state": "error", "summary": None, "error": repr(exc),
+                                  "at": now_iso()}
 
-    def _apply_update(self, mode, limit) -> None:
-        from provisioning import updater
-        res = updater.fetch_updates(self.project, self.watches, mode, limit)
-        stats = self._fire_events(res["events"])
-        # persist to the durable events file (dedup by sha) so Replay can restore them
-        existing = self._load_events()
-        seen = {e.get("commit") for e in existing}
-        self._save_events(existing + [e for e in res["events"] if e.get("commit") not in seen])
-        updater.commit_advances(self.project, res["advances"])
-        self.update_status = {"state": "done", "preview": None, "error": None, "at": now_iso(),
-                              "summary": {"processed": res["processed"], "mode": mode, **stats}}
+    # ----------------------------------------------------------- fill missing triage (tokens)
+    def run_fill(self, mode=None, limit=None) -> None:
+        """Triage the untriaged (yellow) commits — the ONLY token-spending action.
+        mode=None counts and auto-runs under the threshold, else parks in 'preview';
+        mode 'all'/'latest' triages the chosen set (newest-first)."""
+        try:
+            from provisioning.updater import THRESHOLD
+            untriaged = [r for r in self.results if _event_label(r) == "untriaged"]
+            if mode is None:
+                if not untriaged:
+                    self.fill_status = {"state": "done", "preview": None, "error": None,
+                                        "at": now_iso(), "summary": {"message": "nothing to triage"}}
+                elif len(untriaged) <= THRESHOLD:
+                    self._apply_fill(untriaged)
+                else:
+                    self.fill_status = {"state": "preview", "summary": None, "error": None,
+                                        "at": now_iso(),
+                                        "preview": {"total": len(untriaged), "threshold": THRESHOLD}}
+            else:
+                chosen = untriaged[:limit] if (mode == "latest" and limit) else untriaged
+                self._apply_fill(chosen)
+        except Exception as exc:
+            self.fill_status = {"state": "error", "preview": None, "summary": None,
+                                "error": repr(exc), "at": now_iso()}
+
+    def _apply_fill(self, results) -> None:
+        stats = {"triaged": 0, "live_calls": 0, "cache_hits": 0, "tokens_in": 0, "tokens_out": 0}
+        for r in results:
+            watch = self.watch_by_component.get(r.get("component"))
+            if not watch:
+                continue
+            files = [m["path"] for m in r.get("in_scope", [])]
+            verdict, err = self.call_triage(watch["url"], r["commit"], files,
+                                            r.get("cross_repo"), cache_only=False)
+            if err or not verdict:
+                continue
+            r["triage"], r["status"] = verdict, "triaged"
+            stats["triaged"] += 1
+            src = verdict.get("_triage_source")
+            if src == "claude-live":
+                stats["live_calls"] += 1
+                u = verdict.get("usage") or {}
+                stats["tokens_in"] += u.get("input_tokens") or 0
+                stats["tokens_out"] += u.get("output_tokens") or 0
+            elif src == "claude-cache":
+                stats["cache_hits"] += 1
+        self.fill_status = {"state": "done", "preview": None, "error": None, "at": now_iso(),
+                            "summary": stats}
 
     # ----------------------------------------------------------- summary
     def summary(self) -> dict:
@@ -570,16 +605,21 @@ watched repositories and the upstream commit events being triaged. Triage backen
 
 _LABEL_COLOR = {
     "response_required": "#C0392B", "needs_human_review": "#B9770E",
-    "not_meaningful": "#66BB6A", "suppressed": "#2E7D32",
+    "untriaged": "#F1C40F", "not_meaningful": "#66BB6A", "suppressed": "#2E7D32",
     "not_monitored": "#5D6D7E", "ignored": "#7F8C8D", "triage_error": "#C0392B",
 }
 _ACTIONABLE = ("response_required", "needs_human_review")
+_UNTRIAGED_SRC = ("cache-only-failsafe", "error-failsafe")
 
 
 def _event_label(r):
-    """The single status label an event is filtered/coloured by: the triage verdict
-    when triaged, else the pipeline status (suppressed / not_monitored / ...)."""
-    return (r.get("triage") or {}).get("verdict") or r.get("status", "?")
+    """The single status label an event is filtered/coloured by. A commit that was
+    fired cache-only and had no cached verdict is UNTRIAGED (yellow) — distinct from a
+    real needs_human_review. Otherwise: the triage verdict, else the pipeline status."""
+    t = r.get("triage") or {}
+    if t.get("_triage_source") in _UNTRIAGED_SRC:
+        return "untriaged"
+    return t.get("verdict") or r.get("status", "?")
 
 
 def _label_color(label):
@@ -730,11 +770,15 @@ def render_project(reg: Registry, ps: ProjectState, status_filter: str = None) -
                       f"<a href='{all_href}' style='font-size:12px;margin-left:6px'>all</a> &middot; "
                       f"<a href='{act_href}' style='font-size:12px'>actionable</a></div>")
 
+    CARD_CAP = 300
     if not ps.results:
         cards = "<p class='muted'>No commit events received yet for this project.</p>"
+    elif not filtered:
+        cards = "<p class='muted'>No events match this filter.</p>"
     else:
-        cards = "".join(result_card(r) for r in filtered) or \
-            "<p class='muted'>No events match this filter.</p>"
+        note = (f"<p class='muted'>showing newest {CARD_CAP} of {len(filtered)} — narrow with "
+                f"the filter chips above.</p>" if len(filtered) > CARD_CAP else "")
+        cards = note + "".join(result_card(r) for r in filtered[:CARD_CAP])
 
     rs = ps.recreate_status
     if rs["state"] == "running":
@@ -774,37 +818,59 @@ def render_project(reg: Registry, ps: ProjectState, status_filter: str = None) -
         rpt = "<span class='muted'>re-fire cached events (no new fetch, no tokens)</span>"
     replay_html = f"{replay_btn} <span style='font-size:12px'>{rpt}</span>"
 
-    # Check-for-updates: count new upstream commits since the cursor (or tag date),
-    # warn over threshold, then backfill through the webhook path.
-    def _ubtn(label, q, bg):
-        return (f"<button onclick=\"this.disabled=true;fetch('/update?project={quote(ps.name)}{q}',"
-                f"{{method:'POST'}}).then(()=>setTimeout(()=>location.reload(),500))\" "
-                f"style='background:{bg};color:#fff;border:0;border-radius:4px;padding:5px 10px;"
-                f"cursor:pointer;font-size:12px;margin-right:4px'>{label}</button>")
+    # Update: fetch new upstream commits since the cursor (cache-only, no tokens).
     us = ps.update_status
-    check_btn = _ubtn("&#x21bb; Check for updates", "", "#1F6F78")
-    if us["state"] in ("counting", "running"):
-        act = "checking for new upstream commits" if us["state"] == "counting" else "processing updates"
-        ust = f"<span style='color:#B9770E'>{act}&hellip;</span>"
-    elif us["state"] == "preview":
-        p = us["preview"] or {}
-        per = ", ".join(f"{esc(x['component'])}:{x['pending']}"
-                        for x in p.get("repos", []) if x.get("pending"))
-        thr = p.get("threshold", 100)
-        ust = (f"<div style='margin-top:6px;color:#C0392B'><b>{p.get('total')} new commits</b> pending "
-               f"since the built release ({esc(per)}). "
-               + _ubtn(f"Process all {p.get('total')}", "&amp;mode=all", "#C0392B")
-               + _ubtn(f"Only latest {thr}", f"&amp;mode=latest&amp;limit={thr}", "#B9770E")
-               + _ubtn("Cancel", "&amp;mode=cancel", "#7F8C8D") + "</div>")
+    update_btn = (f"<button onclick=\"this.disabled=true;fetch('/update?project={quote(ps.name)}',"
+                  f"{{method:'POST'}}).then(()=>setTimeout(()=>location.reload(),500))\" "
+                  f"style='background:#1F6F78;color:#fff;border:0;border-radius:4px;padding:6px 12px;"
+                  f"cursor:pointer;font-size:13px'>&#x21bb; Check for updates</button>")
+    if us["state"] == "running":
+        ust = "<span style='color:#B9770E'>fetching new upstream commits&hellip;</span>"
     elif us["state"] == "done":
         s = us["summary"] or {}
-        ust = (f"<span style='color:#2E7D32'>{esc(s['message'])}</span>" if s.get("message")
-               else f"<span style='color:#2E7D32'>updated: {_tokline(s)}</span>")
+        ust = (f"<span style='color:#2E7D32'>added {s.get('added', 0)} new commit(s) "
+               f"&middot; {s.get('untriaged', 0)} untriaged</span>")
+        if s.get("warnings"):
+            ust += f" <span style='color:#B9770E'>&middot; {esc('; '.join(s['warnings']))}</span>"
     elif us["state"] == "error":
         ust = f"<span style='color:#C0392B'>update error: {esc(us['error'])}</span>"
     else:
-        ust = "<span class='muted'>webhooks handle new commits; click to backfill / poll manually</span>"
-    update_html = f"{check_btn} <span style='font-size:12px'>{ust}</span>"
+        ust = "<span class='muted'>fetch new commits (local git, no tokens); untriaged show yellow</span>"
+    update_html = f"{update_btn} <span style='font-size:12px'>{ust}</span>"
+
+    # Fill missing triage: the ONLY token-spending action; count-then-confirm over threshold.
+    def _fbtn(label, q, bg):
+        return (f"<button onclick=\"this.disabled=true;fetch('/fill?project={quote(ps.name)}{q}',"
+                f"{{method:'POST'}}).then(()=>setTimeout(()=>location.reload(),500))\" "
+                f"style='background:{bg};color:#fff;border:0;border-radius:4px;padding:5px 10px;"
+                f"cursor:pointer;font-size:12px;margin-right:4px'>{label}</button>")
+    fs = ps.fill_status
+    fill_btn = _fbtn(f"&#x2699; Fill missing triage ({counts.get('untriaged', 0)})", "", "#8E44AD")
+    if fs["state"] in ("counting", "running"):
+        fst = "<span style='color:#B9770E'>triaging&hellip; (Claude)</span>"
+    elif fs["state"] == "preview":
+        p = fs["preview"] or {}
+        thr = p.get("threshold", 100)
+        fst = (f"<div style='margin-top:6px;color:#C0392B'><b>{p.get('total')} untriaged</b> commits "
+               f"&mdash; this spends Claude tokens. "
+               + _fbtn(f"Triage all {p.get('total')}", "&amp;mode=all", "#C0392B")
+               + _fbtn(f"Only latest {thr}", f"&amp;mode=latest&amp;limit={thr}", "#B9770E")
+               + _fbtn("Cancel", "&amp;mode=cancel", "#7F8C8D") + "</div>")
+    elif fs["state"] == "done":
+        s = fs["summary"] or {}
+        if s.get("message"):
+            fst = f"<span style='color:#2E7D32'>{esc(s['message'])}</span>"
+        else:
+            tk = (s.get("tokens_in", 0) or 0) + (s.get("tokens_out", 0) or 0)
+            fst = (f"<span style='color:#2E7D32'>triaged {s.get('triaged', 0)} "
+                   f"&middot; {s.get('live_calls', 0)} Claude call(s)"
+                   + (f" ~{tk // 1000}k tok" if tk else "")
+                   + (f" &middot; {s['cache_hits']} cached" if s.get("cache_hits") else "") + "</span>")
+    elif fs["state"] == "error":
+        fst = f"<span style='color:#C0392B'>fill error: {esc(fs['error'])}</span>"
+    else:
+        fst = "<span class='muted'>run Claude triage on the yellow (untriaged) commits</span>"
+    fill_html = f"{fill_btn} <span style='font-size:12px'>{fst}</span>"
 
     body = f"""
 <p><a href="/">&larr; Projects</a></p>
@@ -812,6 +878,7 @@ def render_project(reg: Registry, ps: ProjectState, status_filter: str = None) -
 <p>{recreate_html}</p>
 <p>{replay_html}</p>
 <p>{update_html}</p>
+<p>{fill_html}</p>
 <p class="muted" style="font-size:13px"><b>Precision funnel:</b> {funnel}</p>
 <h2>Monitored repos ({len(mon)})</h2>
 <table><tr><th>Component</th><th>VCS URL</th><th>Relationship</th><th>Provenance</th><th>Pinned ref</th><th>Watches (branch)</th></tr>
@@ -909,8 +976,26 @@ class MonitorHandler(BaseHTTPRequestHandler):
             self._send_json(202, {"status": "started", "project": project})
             return
 
-        # UI action: check for / backfill new upstream commits since the cursor.
+        # UI action: fetch new upstream commits since the cursor (cache-only, no tokens).
         if parsed.path == "/update":
+            qs = parse_qs(parsed.query)
+            project = unquote(qs["project"][0]) if "project" in qs else None
+            ps = self.reg.projects.get(project)
+            if ps is None:
+                self._send_json(404, {"error": f"unknown project {project}"})
+                return
+            with ps.update_lock:
+                if ps.update_status["state"] == "running":
+                    self._send_json(409, {"status": "busy"})
+                    return
+                ps.update_status = {"state": "running", "summary": None, "error": None,
+                                    "at": now_iso()}
+            threading.Thread(target=ps.run_update, daemon=True).start()
+            self._send_json(202, {"status": "started"})
+            return
+
+        # UI action: fill missing triage (the ONLY token-spending action) — confirm > threshold.
+        if parsed.path == "/fill":
             qs = parse_qs(parsed.query)
             project = unquote(qs["project"][0]) if "project" in qs else None
             ps = self.reg.projects.get(project)
@@ -920,18 +1005,18 @@ class MonitorHandler(BaseHTTPRequestHandler):
             mode = qs.get("mode", [None])[0]
             limit = int(qs["limit"][0]) if "limit" in qs else None
             if mode == "cancel":
-                ps.update_status = {"state": "idle", "preview": None, "summary": None,
-                                    "error": None, "at": now_iso()}
+                ps.fill_status = {"state": "idle", "preview": None, "summary": None,
+                                  "error": None, "at": now_iso()}
                 self._send_json(200, {"status": "cancelled"})
                 return
-            with ps.update_lock:
-                if ps.update_status["state"] in ("counting", "running"):
+            with ps.fill_lock:
+                if ps.fill_status["state"] in ("counting", "running"):
                     self._send_json(409, {"status": "busy"})
                     return
-                ps.update_status = {"state": ("counting" if mode is None else "running"),
-                                    "preview": ps.update_status.get("preview"), "summary": None,
-                                    "error": None, "at": now_iso()}
-            threading.Thread(target=ps.run_update, kwargs={"mode": mode, "limit": limit},
+                ps.fill_status = {"state": ("counting" if mode is None else "running"),
+                                  "preview": ps.fill_status.get("preview"), "summary": None,
+                                  "error": None, "at": now_iso()}
+            threading.Thread(target=ps.run_fill, kwargs={"mode": mode, "limit": limit},
                              daemon=True).start()
             self._send_json(202, {"status": "started", "mode": mode})
             return
