@@ -72,6 +72,13 @@ def _resolve_tag(clone, version):
                             f"refs/tags/{cand}"], capture_output=True, text=True)
         if r.returncode == 0:
             return cand
+    # Tagless fork (e.g. busybox-w32 monitored on master): the pinned_ref is the
+    # build commit itself, not a release tag. Fall back to resolving it as a
+    # commit-ish so the first patch-gap walk still has an exclusive lower bound.
+    r = subprocess.run(["git", "-C", str(clone), "rev-parse", "--verify", "--quiet",
+                        f"{v}^{{commit}}"], capture_output=True, text=True)
+    if r.returncode == 0:
+        return v
     return None
 
 
