@@ -121,17 +121,17 @@ class ProjectState:
                 "commits": [{"id": ev["commit"], "message": ev.get("message", ""),
                              "added": [], "removed": [], "modified": ev.get("files_changed", [])}]}
 
-    def _fire_events(self, records):
+    def _fire_events(self, records, cache_only=False):
         """Fire event records through the webhook path, skipping already-seen commits,
         and tally Claude spend (live calls vs cache hits) so the UI can prove a replay
-        costs nothing."""
+        costs nothing. cache_only=True (replay) never calls Claude on a triage miss."""
         stats = {"events": 0, "live_calls": 0, "cache_hits": 0, "tokens_in": 0, "tokens_out": 0}
         for ev in records:
             sha = ev.get("commit")
             if sha and sha in self._seen:
                 continue
             n0 = len(self.results)
-            self.process_push(self._to_push(ev))
+            self.process_push(self._to_push(ev), cache_only=cache_only)
             for r in self.results[:len(self.results) - n0]:
                 if r.get("commit"):
                     self._seen.add(r["commit"])
@@ -152,7 +152,7 @@ class ProjectState:
         tokens). Restores 'current state' for free."""
         self.results = []
         self._seen = set()
-        return self._fire_events(self._load_events())
+        return self._fire_events(self._load_events(), cache_only=True)
 
     def run_replay(self):
         try:
@@ -304,10 +304,13 @@ class ProjectState:
         return best
 
     # ----------------------------------------------------------- triage
-    def call_triage(self, vcs_url: str, commit: str, files: list, cross_repo: list = None):
+    def call_triage(self, vcs_url: str, commit: str, files: list, cross_repo: list = None,
+                    cache_only: bool = False):
         body = {"vcs_url": vcs_url, "commit": commit, "files": files}
         if cross_repo:
             body["cross_repo"] = cross_repo
+        if cache_only:
+            body["cache_only"] = True
         req = urllib.request.Request(
             self.triage_url,
             data=json.dumps(body).encode(),
@@ -324,7 +327,7 @@ class ProjectState:
             return None, f"triage service unreachable: {exc}"
 
     # ----------------------------------------------------------- webhook
-    def process_push(self, payload: dict) -> dict:
+    def process_push(self, payload: dict, cache_only: bool = False) -> dict:
         repo_url = (payload.get("repository") or {}).get("clone_url") \
             or (payload.get("repository") or {}).get("url") or ""
         ref = payload.get("ref", "")
@@ -401,7 +404,8 @@ class ProjectState:
                             reason="no changed file is in the compiled set for this build")
             else:
                 verdict, err = self.call_triage(watch["url"], sha,
-                                                [m["path"] for m in matches], cross_repo)
+                                                [m["path"] for m in matches], cross_repo,
+                                                cache_only=cache_only)
                 if err:
                     base.update(status="triage_error", reason=err)
                 else:

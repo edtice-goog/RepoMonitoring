@@ -274,7 +274,9 @@ class ClaudeTriageHandler(BaseHTTPRequestHandler):
             return
 
         # ---- cache miss ----
-        if self.anthropic_client is None:
+        # Server-wide cache-only mode OR a per-request cache_only (used by Replay /
+        # Recreate auto-replay, which must never spend tokens): fail safe, no Claude.
+        if self.anthropic_client is None or req.get("cache_only"):
             print(f"[triage-claude] MISS (cache-only) {commit[:12]}  -> failsafe")
             self._send_json(200, {"commit": commit, "vcs_url": vcs_url,
                                   "files_evaluated": files,
