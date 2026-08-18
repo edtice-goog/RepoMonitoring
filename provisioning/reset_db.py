@@ -16,7 +16,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from sqlalchemy import text          # noqa: E402
 from db.session import engine        # noqa: E402
 
-TABLES = ["event_cursor", "source_provenance", "capture_file", "capture", "project"]
+TABLES = ["rendered_event", "event_cursor", "source_provenance", "capture_file", "capture", "project"]
 
 
 def main() -> None:

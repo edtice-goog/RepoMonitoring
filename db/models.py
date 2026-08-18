@@ -17,6 +17,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 
 from sqlalchemy import Boolean, DateTime, ForeignKey, String, Text, UniqueConstraint
+from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
 
@@ -103,3 +104,31 @@ class EventCursor(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
 
     __table_args__ = (UniqueConstraint("project_name", "repo_url", name="uq_cursor_project_repo"),)
+
+
+class RenderedEvent(Base):
+    """Materialized cache of a project's RENDERED (triaged) commit events.
+
+    NOT a source of truth: it is fully rebuildable from the durable event feed + the
+    triage cache by a replay. It exists so the dashboard renders INSTANTLY at startup
+    (load these rows — no per-event triage round-trip) and so a replay can reconcile in
+    the BACKGROUND (mark every row pending, re-render the feed upserting fresh rows, then
+    sweep the still-pending stale rows) while reads keep serving the previous render.
+
+    Keyed by (project, commit); `payload` is the full result dict the monitor renders
+    from. `pending` drives the mark-and-sweep. Cleared by reset_db / recreate --reset-feed.
+    """
+    __tablename__ = "rendered_event"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    project_name: Mapped[str] = mapped_column(String(200), index=True)
+    commit_sha: Mapped[str] = mapped_column(String(64))
+    component: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    committed_at: Mapped[str | None] = mapped_column(String(40), nullable=True)  # ISO, ordering
+    label: Mapped[str | None] = mapped_column(String(40), nullable=True)         # _event_label
+    pending: Mapped[bool] = mapped_column(Boolean, default=False, index=True)
+    payload: Mapped[dict] = mapped_column(JSONB)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
+
+    __table_args__ = (UniqueConstraint("project_name", "commit_sha",
+                                       name="uq_rendered_project_commit"),)

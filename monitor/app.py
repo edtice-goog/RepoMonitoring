@@ -92,6 +92,7 @@ class ProjectState:
         self.fill_lock = threading.Lock()
         self._seen = set()          # commit shas already surfaced (replay/update dedup)
         self._load()
+        self.load_rendered()        # populate results from the Postgres render cache (instant)
 
     def reload(self) -> None:
         """Re-read the (freshly recreated) JSON in place, keeping runtime results."""
@@ -155,32 +156,73 @@ class ProjectState:
         else:                                   # cache-only-failsafe / error-failsafe
             stats["untriaged"] += 1
 
-    def _fire_events(self, records, cache_only=False):
-        """Fire event records through the webhook path, skipping already-seen commits,
-        and tally an EXACT partition (cached / Claude / untriaged / suppressed /
-        reference-only) so the UI can prove a replay costs nothing AND account for every
-        event. cache_only=True (replay) never calls Claude on a triage miss."""
+    def _fire_events(self, records, cache_only=False, sink=None, seen=None):
+        """Fire event records through the webhook path into `sink` (default self.results),
+        skipping commits already in `seen` (default self._seen), and tally an EXACT
+        partition (cached / Claude / untriaged / suppressed / reference-only) so the UI can
+        prove a replay costs nothing AND account for every event. A separate sink/seen lets
+        replay build a fresh list without disturbing the one being served."""
+        if sink is None:
+            sink = self.results
+        if seen is None:
+            seen = self._seen
         stats = {"events": 0, "live_calls": 0, "cache_hits": 0, "untriaged": 0,
                  "suppressed": 0, "not_monitored": 0, "errors": 0,
                  "tokens_in": 0, "tokens_out": 0}
         for ev in records:
             sha = ev.get("commit")
-            if sha and sha in self._seen:
+            if sha and sha in seen:
                 continue
-            n0 = len(self.results)
-            self.process_push(self._to_push(ev), cache_only=cache_only)
-            for r in self.results[:len(self.results) - n0]:
+            n0 = len(sink)
+            self.process_push(self._to_push(ev), cache_only=cache_only, sink=sink)
+            for r in sink[:len(sink) - n0]:
                 if r.get("commit"):
-                    self._seen.add(r["commit"])
+                    seen.add(r["commit"])
                 self._tally(stats, r)
         return stats
 
+    # ------------------------------------------------------- Postgres render cache
+    def _row(self, r):
+        """Shape a rendered result into a rendered_event row (index columns + full payload)."""
+        return {"project_name": self.project, "commit_sha": r.get("commit") or "?",
+                "component": r.get("component"), "committed_at": r.get("committed_at"),
+                "label": _event_label(r), "payload": r}
+
+    def _persist(self, results):
+        """Upsert rendered results into the Postgres cache (best-effort — a cache write must
+        never break the live render)."""
+        try:
+            from db import rendered
+            rendered.save_rows([self._row(r) for r in results if r.get("commit")])
+        except Exception as exc:
+            print(f"[cache] persist skipped for {self.project}: {exc!r}", flush=True)
+
+    def load_rendered(self):
+        """Load this project's rendered events from Postgres into memory (the startup path
+        — no per-event triage round-trip). Empty on a cold cache; a bootstrap replay fills
+        it. Errors are non-fatal (fall back to an empty in-memory feed)."""
+        try:
+            from db import rendered
+            self.results = rendered.load(self.project)
+            self._seen = {r.get("commit") for r in self.results if r.get("commit")}
+        except Exception as exc:
+            print(f"[cache] load skipped for {self.project}: {exc!r}", flush=True)
+            self.results, self._seen = [], set()
+
     def replay_events(self):
-        """Reset the feed and re-fire the durable events file (triage from cache -> 0
-        tokens). Restores 'current state' for free."""
-        self.results = []
-        self._seen = set()
-        return self._fire_events(self._load_events(), cache_only=True)
+        """Re-render the durable feed and reconcile the Postgres cache with a MARK-AND-SWEEP,
+        then atomically swap the in-memory list. Reads keep seeing the previous render until
+        the swap; a stale or mis-rendered row (still pending after the re-render) is removed.
+        Triage is cache-only, so a replay costs no tokens."""
+        from db import rendered
+        records = self._load_events()
+        new_results, new_seen = [], set()
+        rendered.mark_pending(self.project)                        # mark every row pending
+        stats = self._fire_events(records, cache_only=True, sink=new_results, seen=new_seen)
+        self._persist(new_results)                                 # upsert fresh -> clears pending
+        rendered.sweep(self.project)                               # remove the still-pending stale
+        self.results, self._seen = new_results, new_seen           # atomic swap (reads saw old)
+        return stats
 
     def run_replay(self):
         try:
@@ -189,6 +231,14 @@ class ProjectState:
         except Exception as exc:
             self.replay_status = {"state": "error", "summary": None, "error": repr(exc),
                                   "at": now_iso()}
+
+    def is_locked(self) -> bool:
+        """True while a replay or recreate is reconciling this project's render cache. The
+        section is locked for WRITES (replay/update/fill/recreate/webhook are refused) but
+        stays readable — the previous render is served until the reconcile swaps it in. The
+        action buttons grey out while locked."""
+        return (self.replay_status["state"] == "running"
+                or self.recreate_status["state"] == "running")
 
     def _load(self) -> None:
         capture = json.loads((self.data_dir / "build-capture.json").read_text(encoding="utf-8-sig"))
@@ -355,7 +405,8 @@ class ProjectState:
             return None, f"triage service unreachable: {exc}"
 
     # ----------------------------------------------------------- webhook
-    def process_push(self, payload: dict, cache_only: bool = False) -> dict:
+    def process_push(self, payload: dict, cache_only: bool = False, sink=None) -> dict:
+        target = self.results if sink is None else sink   # replay renders into its own list
         repo_url = (payload.get("repository") or {}).get("clone_url") \
             or (payload.get("repository") or {}).get("url") or ""
         ref = payload.get("ref", "")
@@ -367,7 +418,7 @@ class ProjectState:
                 "status": "ignored", "reason": "repository not in watch manifest",
                 "commits": [c.get("id", "?") for c in payload.get("commits", [])],
             }
-            self.results.insert(0, result)
+            target.insert(0, result)
             return {"status": "ignored", "reason": result["reason"]}
 
         if not watch.get("monitored", True):
@@ -379,7 +430,7 @@ class ProjectState:
                 sha = commit.get("id") or commit.get("sha") or "?"
                 changed = (commit.get("added") or []) + (commit.get("modified") or []) \
                     + (commit.get("removed") or [])
-                self.results.insert(0, {
+                target.insert(0, {
                     "received_at": now_iso(), "committed_at": commit.get("timestamp"),
                     "repo": repo_url, "ref": ref,
                     "component": watch["component"], "relationship": watch["relationship"],
@@ -440,7 +491,7 @@ class ProjectState:
                     base.update(status="triage_error", reason=err)
                 else:
                     base.update(status="triaged", triage=verdict)
-            self.results.insert(0, base)
+            target.insert(0, base)
             summaries.append({"commit": sha, "status": base["status"],
                               "verdict": base.get("triage", {}).get("verdict")})
         return {"status": "processed", "commits": summaries}
@@ -472,7 +523,9 @@ class ProjectState:
             from provisioning import updater
             watches = [w for w in self.watches if component is None or w["component"] == component]
             res = updater.fetch_updates(self.project, watches, "all", None)
+            before = len(self.results)
             self._fire_events(res["events"], cache_only=True)          # 0 tokens
+            self._persist(self.results[:len(self.results) - before])   # cache the new rows
             existing = self._load_events()
             seen = {e.get("commit") for e in existing}
             self._save_events(existing + [e for e in res["events"] if e.get("commit") not in seen])
@@ -537,6 +590,7 @@ class ProjectState:
                 stats["tokens_out"] += u.get("output_tokens") or 0
             elif src == "claude-cache":
                 stats["cache_hits"] += 1
+        self._persist(results)              # persist the newly-triaged rows to the cache
         stats["scope"] = component or "all repos"
         self.fill_status = {"state": "done", "preview": None, "error": None, "at": now_iso(),
                             "summary": stats}
@@ -646,10 +700,11 @@ class Registry:
             nm = self._register(ps)
             self._remember(ps)
             loaded_dirs.add(d.resolve())
-            # Restore the cached feed (0 tokens) OFF the startup path: replay makes triage
-            # HTTP calls, so a slow/not-yet-up triage service must not stall the monitor.
-            threading.Thread(target=ps.run_replay, daemon=True).start()
-            log(f"[autoload] loaded {nm} <- {d.name} ({why}; replaying feed in background)")
+            # ps loaded its rendered events from Postgres in __init__ — INSTANT, no triage.
+            # Only a cold cache (empty rows but a non-empty feed) needs a bootstrap replay.
+            booted = self._bootstrap_if_cold(ps)
+            log(f"[autoload] loaded {nm} <- {d.name} ({why}; {len(ps.results)} cached event(s)"
+                + (", bootstrapping feed in background" if booted else "") + ")")
 
         # 1) exact dirs remembered from the last run — authoritative, no ambiguity.
         try:
@@ -665,6 +720,17 @@ class Registry:
         if set(db_names) - {p.project for p in self.projects.values()}:
             for cap in sorted(REPO_ROOT.glob("live-*/build-capture.json")):
                 _try_load(cap.parent, "scan")
+
+    def _bootstrap_if_cold(self, ps):
+        """If the render cache is cold (no rows loaded) but the durable feed has events,
+        kick a one-time background replay to populate Postgres. Warm cache -> no-op, so a
+        restart is instant and only the first run (or a project ingested before the cache
+        existed) pays the replay cost. Background, so a slow triage service can't stall
+        startup."""
+        if not ps.results and ps._load_events():
+            threading.Thread(target=ps.run_replay, daemon=True).start()
+            return True
+        return False
 
     def run_add(self, project_name, data_dir=None):
         """Load an ALREADY-recreated project data dir into the running monitor. The
@@ -688,9 +754,9 @@ class Registry:
                     self.add_status = {"state": "done", "message": f"reloaded {nm}",
                                        "error": None, "at": now_iso()}
                     return
-            name = self.add_project(data_dir)
+            name = self.add_project(data_dir)     # loads rendered cache in __init__ (instant)
             self._remember(self.projects[name])   # survive a restart
-            self.projects[name].replay_events()   # restore any cached events (0 tokens)
+            self._bootstrap_if_cold(self.projects[name])   # replay only if the cache is cold
             self.add_status = {"state": "done", "message": f"added {name}", "error": None,
                                "at": now_iso()}
         except Exception as exc:
@@ -740,8 +806,17 @@ class Registry:
         if not matched:
             return {"status": "ignored", "reason": "repository not watched by any project",
                     "repo": repo_url}
-        return {"status": "routed",
-                "projects": [{"project": n, **p.process_push(payload)} for n, p in matched]}
+        out = []
+        for n, p in matched:
+            if p.replay_status["state"] == "running" or p.recreate_status["state"] == "running":
+                out.append({"project": n, "status": "busy",
+                            "reason": "a replay/recreate is in progress; retry shortly"})
+                continue
+            before = len(p.results)
+            res = p.process_push(payload)                 # live webhook -> self.results
+            p._persist(p.results[:len(p.results) - before])   # persist the new rows
+            out.append({"project": n, **res})
+        return {"status": "routed", "projects": out}
 
 
 # --------------------------------------------------------------- rendering
@@ -875,6 +950,19 @@ def _tokline(s):
 def render_project(reg: Registry, ps: ProjectState, status_filter: str = None,
                    comp_filter: str = None) -> bytes:
     comps_on = set(comp_filter.split(",")) if comp_filter else None   # None = all shown
+    locked = ps.is_locked()   # replay/recreate reconciling -> action buttons grey out
+
+    def _greybtn(label, pad="6px 12px", fsize=13):
+        return (f"<button disabled title='locked — a replay/recreate is reconciling this "
+                f"project' style='background:#d5d5d5;color:#8a8a8a;border:0;border-radius:4px;"
+                f"padding:{pad};font-size:{fsize}px;cursor:not-allowed'>{label}</button>")
+
+    lock_banner = ("<div style='background:#FCF3CF;border:1px solid #F1C40F;border-radius:4px;"
+                   "padding:6px 12px;margin:10px 0;font-size:13px;color:#7D6608'>&#128274; "
+                   "Replay/recreate in progress — actions are locked; the current render is "
+                   "still being served and this page refreshes automatically.</div>") if locked else ""
+    # While locked, poll: reload so the buttons re-enable the moment the reconcile finishes.
+    lock_poll = "<script>setTimeout(function(){location.reload();},2500);</script>" if locked else ""
 
     def _pin(w):
         ref = (f"<code title='Immutable file-scope ref — the exact snapshot we "
@@ -999,6 +1087,9 @@ def render_project(reg: Registry, ps: ProjectState, status_filter: str = None,
     def _repo_actions(w):
         comp = w["component"]
         n = untri_by_comp.get(comp, 0)
+        if locked:
+            return (_greybtn("&#x21bb; updates", pad="2px 7px", fsize=11)
+                    + " " + _greybtn(f"&#x2699; fill {n}", pad="2px 7px", fsize=11))
         upd = (f"<button title='fetch new commits for {esc(comp)}' onclick=\"this.disabled=true;"
                f"fetch('/update?project={quote(ps.name)}&component={quote(comp)}',{{method:'POST'}})"
                f".then(()=>setTimeout(()=>location.reload(),600))\" style='background:#1F6F78;"
@@ -1065,18 +1156,20 @@ def render_project(reg: Registry, ps: ProjectState, status_filter: str = None,
         st = f"<span style='color:#C0392B'>recreate error: {esc(rs['error'])}</span>"
     else:
         st = "<span class='muted'>idle</span>"
-    recreate_html = (
+    recreate_btn = _greybtn("&#x1F504; Recreate") if locked else (
         f"<button onclick=\"this.disabled=true;fetch('/recreate?project={quote(ps.name)}',"
         f"{{method:'POST'}}).then(()=>setTimeout(()=>location.reload(),500))\" "
         f"style='background:#582C83;color:#fff;border:0;border-radius:4px;padding:6px 12px;"
-        f"cursor:pointer;font-size:13px'>&#x1F504; Recreate</button> <span style='font-size:12px'>{st}</span>")
+        f"cursor:pointer;font-size:13px'>&#x1F504; Recreate</button>")
+    recreate_html = f"{recreate_btn} <span style='font-size:12px'>{st}</span>"
 
     # Replay: re-fire the durable events file from cache (no fetch, no tokens).
     rp = ps.replay_status
-    replay_btn = (f"<button onclick=\"this.disabled=true;fetch('/replay?project={quote(ps.name)}',"
-                  f"{{method:'POST'}}).then(()=>setTimeout(()=>location.reload(),500))\" "
-                  f"style='background:#1F6F78;color:#fff;border:0;border-radius:4px;padding:6px 12px;"
-                  f"cursor:pointer;font-size:13px'>&#x25B6; Replay cached</button>")
+    replay_btn = _greybtn("&#x25B6; Replay cached") if locked else (
+        f"<button onclick=\"this.disabled=true;fetch('/replay?project={quote(ps.name)}',"
+        f"{{method:'POST'}}).then(()=>setTimeout(()=>location.reload(),500))\" "
+        f"style='background:#1F6F78;color:#fff;border:0;border-radius:4px;padding:6px 12px;"
+        f"cursor:pointer;font-size:13px'>&#x25B6; Replay cached</button>")
     if rp["state"] == "running":
         rpt = "<span style='color:#B9770E'>replaying cached events&hellip;</span>"
     elif rp["state"] == "done":
@@ -1089,10 +1182,11 @@ def render_project(reg: Registry, ps: ProjectState, status_filter: str = None,
 
     # Update: fetch new upstream commits since the cursor (cache-only, no tokens).
     us = ps.update_status
-    update_btn = (f"<button onclick=\"this.disabled=true;fetch('/update?project={quote(ps.name)}',"
-                  f"{{method:'POST'}}).then(()=>setTimeout(()=>location.reload(),500))\" "
-                  f"style='background:#1F6F78;color:#fff;border:0;border-radius:4px;padding:6px 12px;"
-                  f"cursor:pointer;font-size:13px'>&#x21bb; Check for updates</button>")
+    update_btn = _greybtn("&#x21bb; Check for updates") if locked else (
+        f"<button onclick=\"this.disabled=true;fetch('/update?project={quote(ps.name)}',"
+        f"{{method:'POST'}}).then(()=>setTimeout(()=>location.reload(),500))\" "
+        f"style='background:#1F6F78;color:#fff;border:0;border-radius:4px;padding:6px 12px;"
+        f"cursor:pointer;font-size:13px'>&#x21bb; Check for updates</button>")
     if us["state"] == "running":
         ust = "<span style='color:#B9770E'>fetching new upstream commits&hellip;</span>"
     elif us["state"] == "done":
@@ -1109,6 +1203,8 @@ def render_project(reg: Registry, ps: ProjectState, status_filter: str = None,
 
     # Fill missing triage: the ONLY token-spending action; count-then-confirm over threshold.
     def _fbtn(label, q, bg):
+        if locked:
+            return _greybtn(label, pad="5px 10px", fsize=12)
         return (f"<button onclick=\"this.disabled=true;fetch('/fill?project={quote(ps.name)}{q}',"
                 f"{{method:'POST'}}).then(()=>setTimeout(()=>location.reload(),500))\" "
                 f"style='background:{bg};color:#fff;border:0;border-radius:4px;padding:5px 10px;"
@@ -1148,6 +1244,7 @@ def render_project(reg: Registry, ps: ProjectState, status_filter: str = None,
     body = f"""
 <p><a href="/">&larr; Projects</a></p>
 <h1>{esc(ps.name)} <span class="muted">({esc(ps.build_id)})</span></h1>
+{lock_banner}
 <p>{recreate_html}</p>
 <p>{replay_html}</p>
 <p>{update_html}</p>
@@ -1173,7 +1270,8 @@ function toggleAllComp(src){{
   [].slice.call(document.querySelectorAll('.compfilter')).forEach(function(b){{b.checked=src.checked;}});
   applyCompFilter();
 }}
-</script>"""
+</script>
+{lock_poll}"""
     return _page(f"RepoMonitoring — {ps.name}", body)
 
 
@@ -1279,6 +1377,10 @@ class MonitorHandler(BaseHTTPRequestHandler):
             if ps is None:
                 self._send_json(404, {"error": f"unknown project {project}"})
                 return
+            if ps.is_locked():
+                self._send_json(409, {"status": "busy",
+                                      "reason": "replay/recreate in progress; try again shortly"})
+                return
             with ps.recreate_lock:
                 if ps.recreate_status["state"] == "running":
                     self._send_json(409, {"status": "busy"})
@@ -1297,6 +1399,10 @@ class MonitorHandler(BaseHTTPRequestHandler):
             ps = self.reg.projects.get(project)
             if ps is None:
                 self._send_json(404, {"error": f"unknown project {project}"})
+                return
+            if ps.is_locked():
+                self._send_json(409, {"status": "busy",
+                                      "reason": "replay/recreate in progress; try again shortly"})
                 return
             with ps.replay_lock:
                 if ps.replay_status["state"] == "running":
@@ -1318,6 +1424,10 @@ class MonitorHandler(BaseHTTPRequestHandler):
             if ps is None:
                 self._send_json(404, {"error": f"unknown project {project}"})
                 return
+            if ps.is_locked():
+                self._send_json(409, {"status": "busy",
+                                      "reason": "replay/recreate in progress; try again shortly"})
+                return
             with ps.update_lock:
                 if ps.update_status["state"] == "running":
                     self._send_json(409, {"status": "busy"})
@@ -1338,6 +1448,10 @@ class MonitorHandler(BaseHTTPRequestHandler):
             ps = self.reg.projects.get(project)
             if ps is None:
                 self._send_json(404, {"error": f"unknown project {project}"})
+                return
+            if ps.is_locked():
+                self._send_json(409, {"status": "busy",
+                                      "reason": "replay/recreate in progress; try again shortly"})
                 return
             mode = qs.get("mode", [None])[0]
             limit = int(qs["limit"][0]) if "limit" in qs else None

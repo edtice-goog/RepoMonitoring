@@ -64,7 +64,9 @@ def recreate_project(name, out_dir, refresh_sbom=False, refresh_events=False,
         with SessionLocal() as s:
             n = s.query(EventCursor).filter_by(project_name=name).delete()
             s.commit()
-        log(f"[reset-feed] cleared events file + {n} cursor(s)")
+        from db import rendered
+        rows = rendered.clear(name)          # drop the materialized render cache too
+        log(f"[reset-feed] cleared events file + {n} cursor(s) + {rows} rendered row(s)")
 
     # ---------- seeds from Postgres ----------
     with SessionLocal() as s:
