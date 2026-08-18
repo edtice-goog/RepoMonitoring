@@ -128,11 +128,40 @@ class ProjectState:
                 "commits": [{"id": ev["commit"], "message": ev.get("message", ""),
                              "added": [], "removed": [], "modified": ev.get("files_changed", [])}]}
 
+    @staticmethod
+    def _tally(stats, r):
+        """Partition one fired event into EXACTLY one bucket, so the buckets always sum
+        to the event total (no unexplained remainder in the replay/update summary):
+        in-scope -> cached | Claude-live | untriaged; out-of-scope -> suppressed (not in
+        the compiled set) | reference-only (repo not monitored)."""
+        stats["events"] += 1
+        status = r.get("status")
+        t = r.get("triage") or {}
+        src = t.get("_triage_source")
+        if status == "not_monitored":
+            stats["not_monitored"] += 1
+        elif status == "suppressed":
+            stats["suppressed"] += 1
+        elif status in ("triage_error", "ignored"):
+            stats["errors"] += 1
+        elif src == "claude-live":
+            stats["live_calls"] += 1
+            u = t.get("usage") or {}
+            stats["tokens_in"] += u.get("input_tokens") or 0
+            stats["tokens_out"] += u.get("output_tokens") or 0
+        elif src == "claude-cache":
+            stats["cache_hits"] += 1
+        else:                                   # cache-only-failsafe / error-failsafe
+            stats["untriaged"] += 1
+
     def _fire_events(self, records, cache_only=False):
         """Fire event records through the webhook path, skipping already-seen commits,
-        and tally Claude spend (live calls vs cache hits) so the UI can prove a replay
-        costs nothing. cache_only=True (replay) never calls Claude on a triage miss."""
-        stats = {"events": 0, "live_calls": 0, "cache_hits": 0, "tokens_in": 0, "tokens_out": 0}
+        and tally an EXACT partition (cached / Claude / untriaged / suppressed /
+        reference-only) so the UI can prove a replay costs nothing AND account for every
+        event. cache_only=True (replay) never calls Claude on a triage miss."""
+        stats = {"events": 0, "live_calls": 0, "cache_hits": 0, "untriaged": 0,
+                 "suppressed": 0, "not_monitored": 0, "errors": 0,
+                 "tokens_in": 0, "tokens_out": 0}
         for ev in records:
             sha = ev.get("commit")
             if sha and sha in self._seen:
@@ -142,16 +171,7 @@ class ProjectState:
             for r in self.results[:len(self.results) - n0]:
                 if r.get("commit"):
                     self._seen.add(r["commit"])
-                t = r.get("triage") or {}
-                src = t.get("_triage_source")
-                if src == "claude-live":
-                    stats["live_calls"] += 1
-                    u = t.get("usage") or {}
-                    stats["tokens_in"] += u.get("input_tokens") or 0
-                    stats["tokens_out"] += u.get("output_tokens") or 0
-                elif src == "claude-cache":
-                    stats["cache_hits"] += 1
-            stats["events"] += 1
+                self._tally(stats, r)
         return stats
 
     def replay_events(self):
@@ -522,15 +542,17 @@ class ProjectState:
     def summary(self) -> dict:
         comps = {w["component"] for w in self.watches}
         mon = {w["component"] for w in self.watches if w.get("monitored")}
-        alerts = sum(1 for r in self.results
-                     if (r.get("triage") or {}).get("verdict") == "response_required")
-        review = sum(1 for r in self.results
-                     if (r.get("triage") or {}).get("verdict") == "needs_human_review")
+        # Count by the SAME label the project page filters/colours by, so an untriaged
+        # (cache-only-failsafe) event is its own bucket and NOT folded into needs-review
+        # — the list-page numbers then line up with the project-page chips.
+        labels = Counter(_event_label(r) for r in self.results)
         last = self.results[0]["received_at"] if self.results else "—"
         return {"name": self.name, "project": self.project, "build_id": self.build_id,
                 "components": len(comps), "monitored": len(mon),
                 "reference_only": len(comps) - len(mon), "events": len(self.results),
-                "alerts": alerts, "needs_review": review, "last_activity": last}
+                "alerts": labels.get("response_required", 0),
+                "needs_review": labels.get("needs_human_review", 0),
+                "untriaged": labels.get("untriaged", 0), "last_activity": last}
 
 
 # --------------------------------------------------------------- registry
@@ -761,6 +783,7 @@ def render_project_list(reg: Registry) -> bytes:
             f"<td>{s['events']}</td>"
             f"<td>{pill(s['alerts'], '#C0392B')}</td>"
             f"<td>{pill(s['needs_review'], '#B9770E')}</td>"
+            f"<td>{pill(s['untriaged'], '#F1C40F')}</td>"
             f"<td class='muted'>{esc(s['last_activity'])}</td></tr>")
     body = f"""
 <h1>RepoMonitoring <span class="muted">— {len(reg.projects)} project(s)</span></h1>
@@ -769,7 +792,7 @@ watched repositories and the upstream commit events being triaged. Triage backen
 <code>{esc(reg.triage_url)}</code>.</p>
 <table>
 <tr><th>Project</th><th>Components</th><th>Monitored</th><th>Reference-only</th>
-<th>Events</th><th>Response&nbsp;req.</th><th>Needs&nbsp;review</th><th>Last activity</th></tr>
+<th>Events</th><th>Response&nbsp;req.</th><th>Needs&nbsp;review</th><th>Untriaged</th><th>Last activity</th></tr>
 {rows}</table>"""
     return _page("RepoMonitoring — projects", body)
 
@@ -798,18 +821,35 @@ def _label_color(label):
 
 
 def _tokline(s):
-    """Human token/cost summary for a replay/update action — proof of no repeat spend."""
+    """Human token/cost summary for a replay/update action — proof of no repeat spend AND
+    an exact account of every event. in-scope (cached + Claude + untriaged) and out-of-
+    scope (suppressed + reference-only [+ errors]) always sum to the event total."""
     if not s:
         return ""
     tk = (s.get("tokens_in", 0) or 0) + (s.get("tokens_out", 0) or 0)
-    parts = [f"{s.get('events', 0)} events",
-             f"{s.get('live_calls', 0)} Claude call(s)" + (f" ~{tk // 1000}k tok" if tk else "")]
+    inscope = []
     if s.get("cache_hits"):
-        parts.append(f"{s['cache_hits']} cached")
+        inscope.append(f"{s['cache_hits']} cached")
+    inscope.append(f"{s.get('live_calls', 0)} Claude call(s)" + (f" ~{tk // 1000}k tok" if tk else ""))
+    if s.get("untriaged"):
+        inscope.append(f"{s['untriaged']} untriaged")
+    outscope = []
+    if s.get("suppressed"):
+        outscope.append(f"{s['suppressed']} suppressed")
+    if s.get("not_monitored"):
+        outscope.append(f"{s['not_monitored']} reference-only")
+    if s.get("errors"):
+        outscope.append(f"{s['errors']} error(s)")
+    parts = [f"{s.get('events', 0)} events", "in scope: " + " + ".join(inscope)]
+    if outscope:
+        parts.append("out of scope: " + " + ".join(outscope))
     return " &middot; ".join(parts)
 
 
-def render_project(reg: Registry, ps: ProjectState, status_filter: str = None) -> bytes:
+def render_project(reg: Registry, ps: ProjectState, status_filter: str = None,
+                   comp_filter: str = None) -> bytes:
+    comps_on = set(comp_filter.split(",")) if comp_filter else None   # None = all shown
+
     def _pin(w):
         ref = (f"<code title='Immutable file-scope ref — the exact snapshot we "
                f"enumerated files at'>{esc(w['pinned_ref'] or '—')}</code>")
@@ -840,9 +880,17 @@ def render_project(reg: Registry, ps: ProjectState, status_filter: str = None) -
                   f"<code>{esc(bf)}{refpart}</code>{warn}</span>")
         return u
 
-    def _rows(ws, actions=False):
+    def _check_cell(w):
+        on = comps_on is None or w["component"] in comps_on
+        return (f"<td style='text-align:center'><input type='checkbox' class='compfilter' "
+                f"value=\"{esc(w['component'])}\" onchange='applyCompFilter()'"
+                f"{' checked' if on else ''}></td>")
+
+    def _rows(ws, actions=False, checks=False):
         return "".join(
-            f"<tr><td>{esc(w['component'])}</td><td>{_url(w)}</td>"
+            "<tr>"
+            + (_check_cell(w) if checks else "")
+            + f"<td>{esc(w['component'])}</td><td>{_url(w)}</td>"
             f"<td>{esc(w['relationship'])}</td><td>{esc(', '.join(w['provenance']))}</td>"
             f"<td>{_pin(w)}</td><td>{_watch(w)}</td>"
             + (f"<td>{_repo_actions(w)}</td>" if actions else "")
@@ -862,9 +910,10 @@ def render_project(reg: Registry, ps: ProjectState, status_filter: str = None) -
             f"<h2 style='color:#7F8C8D'>Referenced, not monitored ({len(ref)})</h2>"
             f"<p class='muted'>In the SBOM but not compiled from source in this build "
             f"(linked/prebuilt) — listed for transparency, excluded from monitoring.</p>"
-            f"<table><tr><th>Component</th><th>VCS URL</th><th>Relationship</th>"
+            f"<table><tr><th title='filter events by dependency'>&#9745;</th>"
+            f"<th>Component</th><th>VCS URL</th><th>Relationship</th>"
             f"<th>Provenance</th><th>Pinned ref</th><th>Watches (branch)</th></tr>"
-            f"{_rows(ref)}</table>")
+            f"{_rows(ref, checks=True)}</table>")
 
     def result_card(r):
         label = _event_label(r)
@@ -915,7 +964,9 @@ def render_project(reg: Registry, ps: ProjectState, status_filter: str = None) -
     # 100 events are actionable; let the user hide the noise.
     active = set(status_filter.split(",")) if status_filter else None
     counts = Counter(_event_label(r) for r in ps.results)
-    filtered = [r for r in ps.results if active is None or _event_label(r) in active]
+    filtered = [r for r in ps.results
+                if (active is None or _event_label(r) in active)
+                and (comps_on is None or r.get("component") in comps_on)]
     untri_by_comp = Counter(r.get("component") for r in ps.results
                             if _event_label(r) == "untriaged")
 
@@ -934,12 +985,14 @@ def render_project(reg: Registry, ps: ProjectState, status_filter: str = None) -
                f"&#x2699; fill {n}</button>")
         return upd + fil
 
+    comp_q = f"&comp={quote(','.join(sorted(comps_on)))}" if comps_on else ""
+
     def _toggle_href(label):
         cur = set(active) if active else set()
         new = {label} if active is None else (cur - {label} if label in cur else cur | {label})
         if not new:
-            return f"/?project={quote(ps.name)}"
-        return f"/?project={quote(ps.name)}&status={quote(','.join(sorted(new)))}"
+            return f"/?project={quote(ps.name)}{comp_q}"
+        return f"/?project={quote(ps.name)}&status={quote(','.join(sorted(new)))}{comp_q}"
 
     def _chip(label, count, href, on):
         c = _label_color(label)
@@ -954,8 +1007,8 @@ def render_project(reg: Registry, ps: ProjectState, status_filter: str = None) -
                  + [l for l in counts if l not in _LABEL_COLOR])
         chip_html = "".join(_chip(l, counts[l], _toggle_href(l), active is None or l in active)
                             for l in order)
-        all_href = f"/?project={quote(ps.name)}"
-        act_href = f"/?project={quote(ps.name)}&status={quote(','.join(_ACTIONABLE))}"
+        all_href = f"/?project={quote(ps.name)}{comp_q}"
+        act_href = f"/?project={quote(ps.name)}&status={quote(','.join(_ACTIONABLE))}{comp_q}"
         filter_bar = (f"<div style='margin:8px 0'>{chip_html}"
                       f"<a href='{all_href}' style='font-size:12px;margin-left:6px'>all</a> &middot; "
                       f"<a href='{act_href}' style='font-size:12px'>actionable</a></div>")
@@ -1075,12 +1128,26 @@ def render_project(reg: Registry, ps: ProjectState, status_filter: str = None) -
 <p>{fill_html}</p>
 <p class="muted" style="font-size:13px"><b>Precision funnel:</b> {funnel}</p>
 <h2>Monitored repos ({len(mon)})</h2>
-<table><tr><th>Component</th><th>VCS URL</th><th>Relationship</th><th>Provenance</th><th>Pinned ref</th><th>Watches (branch)</th><th>Actions</th></tr>
-{_rows(mon, actions=True)}</table>
+<table><tr><th title="select all — filter the event feed by dependency"><input type="checkbox" onchange="toggleAllComp(this)"{' checked' if comps_on is None else ''}></th><th>Component</th><th>VCS URL</th><th>Relationship</th><th>Provenance</th><th>Pinned ref</th><th>Watches (branch)</th><th>Actions</th></tr>
+{_rows(mon, actions=True, checks=True)}</table>
 {ref_section}
-<h2>Commit events ({len(filtered)}{f' of {len(ps.results)}' if active else ''})</h2>
+<h2>Commit events ({len(filtered)}{f' of {len(ps.results)}' if (active or comps_on) else ''})</h2>
 {filter_bar}
-{cards}"""
+{cards}
+<script>
+function applyCompFilter(){{
+  var boxes=[].slice.call(document.querySelectorAll('.compfilter'));
+  var on=boxes.filter(function(b){{return b.checked;}}).map(function(b){{return b.value;}});
+  var u=new URL(location.href);
+  if(on.length===boxes.length){{u.searchParams.delete('comp');}}
+  else{{u.searchParams.set('comp', on.join(','));}}
+  location.href=u.toString();
+}}
+function toggleAllComp(src){{
+  [].slice.call(document.querySelectorAll('.compfilter')).forEach(function(b){{b.checked=src.checked;}});
+  applyCompFilter();
+}}
+</script>"""
     return _page(f"RepoMonitoring — {ps.name}", body)
 
 
@@ -1110,7 +1177,8 @@ class MonitorHandler(BaseHTTPRequestHandler):
                     self._send_json(404, {"error": f"unknown project {project}"})
                 else:
                     status = unquote(qs["status"][0]) if "status" in qs else None
-                    self._send(200, render_project(self.reg, ps, status),
+                    comp = unquote(qs["comp"][0]) if "comp" in qs else None
+                    self._send(200, render_project(self.reg, ps, status, comp),
                                "text/html; charset=utf-8")
             else:
                 self._send(200, render_project_list(self.reg), "text/html; charset=utf-8")
