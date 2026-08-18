@@ -126,6 +126,7 @@ class ProjectState:
         return {"ref": f"refs/heads/{ev.get('branch', '')}",
                 "repository": {"clone_url": ev["vcs_url"]},
                 "commits": [{"id": ev["commit"], "message": ev.get("message", ""),
+                             "timestamp": ev.get("committed_at"),   # GitHub push convention
                              "added": [], "removed": [], "modified": ev.get("files_changed", [])}]}
 
     @staticmethod
@@ -379,7 +380,8 @@ class ProjectState:
                 changed = (commit.get("added") or []) + (commit.get("modified") or []) \
                     + (commit.get("removed") or [])
                 self.results.insert(0, {
-                    "received_at": now_iso(), "repo": repo_url, "ref": ref,
+                    "received_at": now_iso(), "committed_at": commit.get("timestamp"),
+                    "repo": repo_url, "ref": ref,
                     "component": watch["component"], "relationship": watch["relationship"],
                     "commit": sha, "message": commit.get("message", ""),
                     "files_changed": changed, "in_scope": [], "status": "not_monitored",
@@ -417,6 +419,7 @@ class ProjectState:
 
             base = {
                 "received_at": now_iso(),
+                "committed_at": commit.get("timestamp"),   # the ACTUAL upstream commit date
                 "repo": repo_url, "ref": ref,
                 "component": watch["component"],
                 "relationship": watch["relationship"],
@@ -546,7 +549,10 @@ class ProjectState:
         # (cache-only-failsafe) event is its own bucket and NOT folded into needs-review
         # — the list-page numbers then line up with the project-page chips.
         labels = Counter(_event_label(r) for r in self.results)
-        last = self.results[0]["received_at"] if self.results else "—"
+        # Newest UPSTREAM commit date in the feed (not when we replayed it), so the list
+        # doesn't show every project as "active today".
+        last = (self.results[0].get("committed_at") or self.results[0].get("received_at")) \
+            if self.results else "—"
         return {"name": self.name, "project": self.project, "build_id": self.build_id,
                 "components": len(comps), "monitored": len(mon),
                 "reference_only": len(comps) - len(mon), "events": len(self.results),
@@ -784,7 +790,7 @@ def render_project_list(reg: Registry) -> bytes:
             f"<td>{pill(s['alerts'], '#C0392B')}</td>"
             f"<td>{pill(s['needs_review'], '#B9770E')}</td>"
             f"<td>{pill(s['untriaged'], '#F1C40F')}</td>"
-            f"<td class='muted'>{esc(s['last_activity'])}</td></tr>")
+            f"<td class='muted'>{esc(_fmt_ts(s['last_activity']))}</td></tr>")
     body = f"""
 <h1>RepoMonitoring <span class="muted">— {len(reg.projects)} project(s)</span></h1>
 <p class="muted">Each project is one Black Duck SCA analysis. Select a project to see its
@@ -818,6 +824,26 @@ def _event_label(r):
 
 def _label_color(label):
     return _LABEL_COLOR.get(label, "#34495E")
+
+
+def _fmt_ts(s):
+    """Trim a strict-ISO timestamp to 'YYYY-MM-DD HH:MM' for display; pass anything else
+    through untouched."""
+    s = str(s or "")
+    if len(s) >= 16 and s[4:5] == "-" and s[10:11] == "T":
+        return s[:16].replace("T", " ")
+    return s
+
+
+def _when(r):
+    """The timestamp shown on an event card. Prefer the ACTUAL upstream commit date
+    (committed_at) over received_at — the latter is when we replayed/triaged it, which
+    made every historical fix look like it landed today. Falls back to 'seen <received>'
+    only when the commit date is unknown (e.g. a pre-fix cached record)."""
+    c = r.get("committed_at")
+    if c:
+        return f"committed {esc(_fmt_ts(c))}"
+    return f"seen {esc(_fmt_ts(r.get('received_at', '')))}"
 
 
 def _tokline(s):
@@ -956,7 +982,7 @@ def render_project(reg: Registry, ps: ProjectState, status_filter: str = None,
             f"<div><span class='badge' style='background:{color}'>{esc(label)}</span> "
             f"<b>{esc(r.get('component', r.get('repo', '?')))}</b> "
             f"<code>{esc(str(r.get('commit', r.get('commits', '?'))))[:16]}</code> "
-            f"<span class='muted'>{esc(r.get('ref', ''))} · {esc(r['received_at'])}</span></div>"
+            f"<span class='muted'>{esc(r.get('ref', ''))} · {_when(r)}</span></div>"
             f"{scope_html}"
             f"<div class='rationale'>{rationale}</div>{cross_html}{changed_html}</div>")
 
