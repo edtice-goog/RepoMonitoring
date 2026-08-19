@@ -101,6 +101,23 @@ def kb_conflict(w):
     return bool(kb and pin and _ver_digits(kb) != _ver_digits(pin))
 
 
+def bd_server_for(ps):
+    """The BD server origin a project reads its BoM from: the ingested
+    Project.bd_project_url when DB-seeded, else the manifest's bdProjectUrl.
+    '' means no BD SCA association (valid — recreate then skips the BoM)."""
+    from services import bd_credentials
+    try:
+        from db.session import SessionLocal
+        from db.models import Project
+        with SessionLocal() as sess:
+            row = sess.query(Project).filter_by(name=ps.project).one_or_none()
+            if row is not None:
+                return bd_credentials.origin(row.bd_project_url or "")
+    except Exception:
+        pass
+    return bd_credentials.origin(ps.bd_project_url or "")
+
+
 # --------------------------------------------------------------- per-project state
 class ProjectState:
     def __init__(self, data_dir: Path, triage_url: str):
@@ -1225,8 +1242,7 @@ def render_project(reg: Registry, ps: ProjectState, status_filter: str = None,
     else:
         st = "<span class='muted'>idle</span>"
     recreate_btn = _greybtn("&#x1F504; Recreate") if locked else (
-        f"<button onclick=\"this.disabled=true;fetch('/recreate?project={quote(ps.name)}',"
-        f"{{method:'POST'}}).then(()=>setTimeout(()=>location.reload(),500))\" "
+        f"<button onclick=\"this.disabled=true;doRecreate('{quote(ps.name)}')\" "
         f"style='background:#582C83;color:#fff;border:0;border-radius:4px;padding:6px 12px;"
         f"cursor:pointer;font-size:13px'>&#x1F504; Recreate</button>")
     recreate_html = f"{recreate_btn} <span style='font-size:12px'>{st}</span>"
@@ -1327,6 +1343,26 @@ def render_project(reg: Registry, ps: ProjectState, status_filter: str = None,
 {filter_bar}
 {cards}
 <script>
+function doRecreate(p){{
+  fetch('/recreate?project='+p,{{method:'POST'}}).then(function(r){{
+    if(r.status===428){{
+      return r.json().then(function(b){{
+        var t=prompt('The monitor has no read credential for '+b.server+'.
+'+
+                     'Paste a Black Duck API token with read access (stored server-side '+
+                     'in bd-credentials.local.json for future recreates):');
+        if(!t){{location.reload();return;}}
+        fetch('/bd-credential',{{method:'POST',headers:{{'Content-Type':'application/json'}},
+          body:JSON.stringify({{server:b.server,token:t}})}})
+          .then(function(cr){{
+            if(cr.ok){{doRecreate(p);}}
+            else{{alert('failed to store credential');location.reload();}}
+          }});
+      }});
+    }}
+    setTimeout(function(){{location.reload();}},500);
+  }});
+}}
 function applyCompFilter(){{
   var boxes=[].slice.call(document.querySelectorAll('.compfilter'));
   var on=boxes.filter(function(b){{return b.checked;}}).map(function(b){{return b.value;}});
@@ -1402,6 +1438,22 @@ class MonitorHandler(BaseHTTPRequestHandler):
         # with the monitor — everything needed is in the body. The SBoM is NOT sent; it is
         # reloaded from the BD link and cached. Persist is synchronous; recreate+load runs
         # in the background (poll GET /api/db-projects -> add_status).
+        if parsed.path == "/bd-credential":
+            try:
+                length = int(self.headers.get("Content-Length", 0))
+                req = json.loads(self.rfile.read(length))
+            except (ValueError, json.JSONDecodeError):
+                self._send_json(400, {"error": "body must be valid JSON"})
+                return
+            server, token = (req.get("server") or "").strip(), (req.get("token") or "").strip()
+            if not server or not token:
+                self._send_json(400, {"error": "need server and token"})
+                return
+            from services import bd_credentials
+            key = bd_credentials.put(server, token, bool(req.get("insecure_tls")))
+            self._send_json(200, {"status": "stored", "server": key})
+            return
+
         if parsed.path == "/projects/ingest":
             try:
                 length = int(self.headers.get("Content-Length", 0))
@@ -1449,6 +1501,14 @@ class MonitorHandler(BaseHTTPRequestHandler):
             if ps.is_locked():
                 self._send_json(409, {"status": "busy",
                                       "reason": "replay/recreate in progress; try again shortly"})
+                return
+            # Pre-check: the project's BD server must have a READ credential in the
+            # monitor's own store (the client push config is not the monitor's).
+            # 428 tells the UI to prompt for a key, store it, and retry.
+            from services import bd_credentials
+            server = bd_server_for(ps)
+            if server and bd_credentials.resolve(server) is None:
+                self._send_json(428, {"status": "needs_credential", "server": server})
                 return
             with ps.recreate_lock:
                 if ps.recreate_status["state"] == "running":

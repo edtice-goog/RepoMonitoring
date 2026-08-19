@@ -10,6 +10,7 @@ _extracted.txt
 # Live Black Duck SCA connection config — holds instance URL + API token.
 # Never commit real credentials; copy blackduck.local.example.json and fill in.
 blackduck.local*.json
+bd-credentials.local.json
 
 # Live provisioning / recreation output (instance-derived, regenerable) and venvs.
 live*/

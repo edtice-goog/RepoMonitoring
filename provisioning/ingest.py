@@ -84,7 +84,10 @@ def main() -> None:
     ap.add_argument("--version", required=True)
     ap.add_argument("--emit", type=Path, default=DEFAULT_EMIT)
     ap.add_argument("--bd-url", default=None,
-                    help="BD SCA project link (default: url from local blackduck.local.json)")
+                    help="BD SCA server/project link (default: url from local "
+                         "blackduck.local.json). Pass an empty string for a project "
+                         "with no BD SCA association — valid; the server then builds "
+                         "the watch set from compiled files + .git provenance alone.")
     ap.add_argument("--monitor-url", default="http://127.0.0.1:8378",
                     help="the monitor's ingestion API base (default: %(default)s)")
     ap.add_argument("--replace", action="store_true", help="overwrite an existing project")

@@ -25,6 +25,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
 from db.models import Project                                          # noqa: E402
 from db.session import SessionLocal                                    # noqa: E402
 from services import cache                                            # noqa: E402
+from services.bd_credentials import (MissingBDCredential,               # noqa: E402
+                                     origin as bd_origin,
+                                     resolve as resolve_bd_credential)
 import repo_mapper                                                    # noqa: E402
 from attribute_capture import (BUILD_TOOLS, HDR_EXT, claude_from_files,  # noqa: E402
                                digest_tails, fetch_fileset, norm_repo, resolve_tag,
@@ -81,27 +84,45 @@ def recreate_project(name, out_dir, refresh_sbom=False, refresh_events=False,
                        "actual_source_ref": p.actual_source_ref,
                        "divergent": p.divergent} for p in proj.provenance]
         bd_version = proj.bd_version
+        bd_server = bd_origin(proj.bd_project_url or "")
     log(f"[seed] {len(primaries)} primary TUs, {len(all_compiled)} compiled files, "
         f"{len(provenance)} provenance rows")
 
     # lazily-built external clients — only created if a cache MISS needs them
     clients = {}
     def _gh():   return clients.setdefault("gh", GH(gh_token()))
-    def _bd():   return clients.setdefault("bd", BDClient(cfg["url"], cfg["api_token"], cfg.get("insecure_tls", False)))
+    def _bd():
+        # READ credential for the project's own BD server — from the monitor's
+        # credential store (never the client push config, except as a one-time
+        # same-origin migration inside resolve()).
+        if "bd" not in clients:
+            cred = resolve_bd_credential(bd_server, cfg)
+            if cred is None:
+                raise MissingBDCredential(bd_server)
+            clients["bd"] = BDClient(bd_server, cred["api_token"],
+                                     cred.get("insecure_tls", False))
+        return clients["bd"]
     def _anth(): return clients.setdefault("anth", build_anthropic_client(cfg["anthropic_api_key"]))
 
     # ---------- (1) SBoM (refreshable — the KB-growth source) ----------
-    def sbom_producer():
-        proj, ver, comps = resolve_project_version(_bd(), name, bd_version)
-        return {"components": component_context(comps),
-                "bd_project_url": bd_ui_url(cfg["url"], proj, ver)}
-    raw = cache.cached("sbom", {"project": name, "version": bd_version},
-                       sbom_producer, refresh=refresh_sbom)
-    # Tolerate the pre-link cache shape (a bare component list): no link until a
-    # refresh repopulates the cache.
-    sbom = raw["components"] if isinstance(raw, dict) else raw
-    bd_project_url = raw.get("bd_project_url") if isinstance(raw, dict) else None
-    log(f"[sbom] {len(sbom)} components")
+    # A project with no BD SCA association is valid: the watch set then comes from
+    # Claude-from-files + .git provenance alone, and no BD credential is needed.
+    if not bd_server:
+        sbom, bd_project_url = [], None
+        log("[sbom] no BD SCA association — skipped")
+    else:
+        def sbom_producer():
+            proj, ver, comps = resolve_project_version(_bd(), name, bd_version)
+            return {"components": component_context(comps),
+                    "bd_project_url": bd_ui_url(bd_server, proj, ver)}
+        raw = cache.cached("sbom", {"project": name, "version": bd_version,
+                                    "server": bd_server},
+                           sbom_producer, refresh=refresh_sbom)
+        # Tolerate the pre-link cache shape (a bare component list): no link until
+        # a refresh repopulates the cache.
+        sbom = raw["components"] if isinstance(raw, dict) else raw
+        bd_project_url = raw.get("bd_project_url") if isinstance(raw, dict) else None
+        log(f"[sbom] {len(sbom)} components")
 
     # ---------- (2) vcs-enhance, per component (only new ones miss) ----------
     def vcs_batch(missing_keys):
