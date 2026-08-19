@@ -16,6 +16,7 @@ Usage:
 
 import argparse
 import json
+import os
 import ssl
 import sys
 import urllib.error
@@ -30,9 +31,14 @@ JSON_MEDIA = "application/json"
 
 
 def load_config() -> dict:
-    if not CONFIG_PATH.exists():
-        sys.exit(f"missing config: {CONFIG_PATH} (copy blackduck.local.example.json)")
-    cfg = json.loads(CONFIG_PATH.read_text(encoding="utf-8-sig"))
+    """Config from blackduck.local.json, or the file named by BLACKDUCK_LOCAL_CONFIG —
+    so a run can target a second instance (e.g. blackduck.local.sca233.json) without
+    swapping the default file under other live sessions."""
+    path = Path(os.environ["BLACKDUCK_LOCAL_CONFIG"]) if os.environ.get(
+        "BLACKDUCK_LOCAL_CONFIG") else CONFIG_PATH
+    if not path.exists():
+        sys.exit(f"missing config: {path} (copy blackduck.local.example.json)")
+    cfg = json.loads(path.read_text(encoding="utf-8-sig"))
     if "your-instance" in cfg.get("url", "") or "PASTE" in cfg.get("api_token", ""):
         sys.exit("blackduck.local.json still has placeholder values — fill in url + api_token")
     cfg["url"] = cfg["url"].rstrip("/")
