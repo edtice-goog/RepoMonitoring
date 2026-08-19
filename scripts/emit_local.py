@@ -65,7 +65,12 @@ def norm_repo(url):
 
 
 def slugify(name):
-    return name.lower().replace(" ", "-")
+    """Path- and URL-safe component slug. Slugs become path prefixes in the compiled
+    index and DOM filter values, so anything outside [a-z0-9._-] (e.g. the '/' and
+    parens in 'QP/C++ (QP Real-Time Embedded Framework)') is collapsed to '-'."""
+    import re
+    slug = re.sub(r"[^a-z0-9._]+", "-", (name or "").lower()).strip("-.")
+    return slug or "component"
 
 
 def _git(root, *args):
