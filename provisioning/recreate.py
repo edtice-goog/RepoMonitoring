@@ -30,7 +30,7 @@ from attribute_capture import (BUILD_TOOLS, HDR_EXT, claude_from_files,  # noqa:
                                digest_tails, fetch_fileset, norm_repo,
                                resolve_tag, resolve_watch_refs, slugify)
 from bd_scout import BDClient, load_config                            # noqa: E402
-from bd_provision import (build_anthropic_client, component_context,   # noqa: E402
+from bd_provision import (bd_ui_url, build_anthropic_client, component_context,  # noqa: E402
                           enhance_with_claude, resolve_project_version)
 from gh_replay import GH, gh_token, fetch_commits, parse_owner_repo    # noqa: E402
 
@@ -92,10 +92,15 @@ def recreate_project(name, out_dir, refresh_sbom=False, refresh_events=False,
 
     # ---------- (1) SBoM (refreshable — the KB-growth source) ----------
     def sbom_producer():
-        _, _, comps = resolve_project_version(_bd(), name, bd_version)
-        return component_context(comps)
-    sbom = cache.cached("sbom", {"project": name, "version": bd_version},
-                        sbom_producer, refresh=refresh_sbom)
+        proj, ver, comps = resolve_project_version(_bd(), name, bd_version)
+        return {"components": component_context(comps),
+                "bd_project_url": bd_ui_url(cfg["url"], proj, ver)}
+    raw = cache.cached("sbom", {"project": name, "version": bd_version},
+                       sbom_producer, refresh=refresh_sbom)
+    # Tolerate the pre-link cache shape (a bare component list): no link until a
+    # refresh repopulates the cache.
+    sbom = raw["components"] if isinstance(raw, dict) else raw
+    bd_project_url = raw.get("bd_project_url") if isinstance(raw, dict) else None
     log(f"[sbom] {len(sbom)} components")
 
     # ---------- (2) vcs-enhance, per component (only new ones miss) ----------
@@ -264,7 +269,8 @@ def recreate_project(name, out_dir, refresh_sbom=False, refresh_events=False,
         items.append(it)
     (out_dir / "hub-api-components.json").write_text(json.dumps({
         "_comment": "Union watch manifest (recreated).",
-        "project": name, "version": bd_version, "totalCount": len(items), "items": items},
+        "project": name, "version": bd_version, "bdProjectUrl": bd_project_url,
+        "totalCount": len(items), "items": items},
         indent=2), encoding="utf-8")
 
     # Events are NOT fetched here — recreate rebuilds the MANIFEST only. Upstream

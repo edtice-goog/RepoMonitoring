@@ -42,7 +42,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from bd_scout import load_config, BDClient             # noqa: E402
 from bd_provision import (resolve_project_version, component_context,   # noqa: E402
-                          enhance_with_claude, build_anthropic_client)
+                          enhance_with_claude, build_anthropic_client, bd_ui_url)
 from gh_replay import GH, gh_token, parse_owner_repo   # noqa: E402
 import repo_mapper                                     # noqa: E402
 # Pure-stdlib local collection lives in emit_local (so a build box can import it without
@@ -74,6 +74,17 @@ BUILD_TOOLS = {"cmake", "ninja", "make", "gnu make", "meson", "autoconf",
 
 # parse_emit / digest_tails / norm_repo / slugify / _is_scaffolding / _git and the file
 # extension sets are imported from emit_local (above) — the stdlib-only build-box surface.
+
+
+def _clean_tag(source_ref):
+    """Extract a clean release tag from a `.git` actual-source ref like
+    '68720b48 (curl-8_21_0)'. Returns None if HEAD wasn't exactly on a tag (a
+    describe like 'v1.3.1-1-g59933ec') — in that case fall back to the SCA version."""
+    m = re.search(r"\(([^)]+)\)", source_ref or "")
+    if not m:
+        return None
+    desc = m.group(1)
+    return None if re.search(r"-\d+-g[0-9a-f]+$", desc) else desc
 
 
 # --------------------------------------------------------------- Claude-from-files
@@ -263,7 +274,7 @@ def resolve_watch_refs(gh, client, targets):
         targets: List[WatchRef]
 
     resp = client.messages.parse(
-        model=MODEL, max_tokens=2000, system=SYSTEM_WATCH,
+        model=MODEL, max_tokens=max(2000, 250 * len(ctx)), system=SYSTEM_WATCH,
         messages=[{"role": "user", "content": json.dumps({"targets": ctx}, indent=2)}],
         output_format=Result)
     return {w.slug: w for w in resp.parsed_output.targets}
@@ -295,7 +306,8 @@ def main():
 
     # (1) Black Duck content-identity (canonical).
     bd = BDClient(cfg["url"], cfg["api_token"], cfg.get("insecure_tls", False))
-    _, _, bom = resolve_project_version(bd, args.project, args.version)
+    bd_proj, bd_ver, bom = resolve_project_version(bd, args.project, args.version)
+    bd_project_url = bd_ui_url(cfg["url"], bd_proj, bd_ver)
     anthropic_client = build_anthropic_client(cfg["anthropic_api_key"])
     bd_repos, _ = enhance_with_claude(anthropic_client, component_context(bom))
     for r in bd_repos:
@@ -347,8 +359,13 @@ def main():
         owner, repo = parse_owner_repo(cand["vcs_url"])
         if not owner:
             continue
+        # Prefer the EXACT tag we actually built (git provenance) over the SCA
+        # component version, which can be an unreliable KB label (e.g. a 3.6.3.1
+        # checkout signature-matched as "3.2.0").
+        asrc = cand.get("actual_source")
+        pin = _clean_tag(asrc.get("ref")) if (asrc and not cand.get("divergent")) else None
         try:
-            tag = resolve_tag(gh, owner, repo, cand["version"])
+            tag = pin or resolve_tag(gh, owner, repo, cand["version"])
             ref = tag or gh.get(f"/repos/{owner}/{repo}").get("default_branch", "master")
             fs, _ = fetch_fileset(gh, owner, repo, ref)
         except Exception as exc:
@@ -442,6 +459,7 @@ def main():
             entry["actual_source_ref"] = asrc["ref"]
             entry["divergent"] = c.get("divergent", False)
         repos_detected.append(entry)
+    args.dir.mkdir(parents=True, exist_ok=True)
     (args.dir / "build-capture.json").write_text(json.dumps({
         "_comment": ("Compiled-file index from a REAL BD/CPP capture. Attributed by "
                      ".git ground-truth + repo_mapper multi-map (a file may map to >1 "
@@ -470,7 +488,7 @@ def main():
         items.append(it)
     (args.dir / "hub-api-components.json").write_text(json.dumps({
         "_comment": "Union watch manifest: Black Duck BoM UNION Claude-from-files UNION .git checkouts.",
-        "project": args.project, "version": args.version,
+        "project": args.project, "version": args.version, "bdProjectUrl": bd_project_url,
         "totalCount": len(items), "items": items,
     }, indent=2), encoding="utf-8")
 

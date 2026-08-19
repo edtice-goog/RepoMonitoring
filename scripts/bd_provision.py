@@ -97,6 +97,14 @@ def resolve_project_version(client: BDClient, project_name: str, version_name: s
     return proj, ver, comps
 
 
+def bd_ui_url(base_url: str, proj: dict, ver: dict) -> str:
+    """The human-facing Black Duck web-UI link for one project version (the API
+    hrefs from _meta are not clickable for a person)."""
+    pid = meta_href(proj).rstrip("/").rsplit("/", 1)[-1]
+    vid = meta_href(ver).rstrip("/").rsplit("/", 1)[-1]
+    return f"{base_url.rstrip('/')}/projects/{pid}/versions/{vid}/components"
+
+
 def component_context(comps: list) -> list:
     """Distill each BOM component to the fields Claude needs to resolve a repo."""
     out = []
