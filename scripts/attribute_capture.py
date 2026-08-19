@@ -67,7 +67,9 @@ present from the file evidence. Do not invent components or repositories.
 EXCLUDE build tools and toolchains - CMake, Make, Ninja, Meson, autoconf/\
 automake, and compilers (MSVC, GCC, Clang, LLVM). Their presence in build paths \
 (e.g. CMakeFiles/, compiler probe files) does NOT make them shipped components. \
-List only libraries/software actually compiled or linked into the product."""
+List only libraries/software actually compiled or linked into the product.
+
+The input separates paths COMPILED AS SOURCE (translation units) from paths only INCLUDED AS HEADERS. Report per-component evidence: "compiled-source" when any of its files were compiled as source; "headers-only" when it appears only among the included headers (typical when the component is header-only, or linked as a prebuilt library whose headers the build includes). Headers-only components are real dependencies - do report them - but they are watched as reference-only, not monitored."""
 
 BUILD_TOOLS = {"cmake", "ninja", "make", "gnu make", "meson", "autoconf",
                "automake", "gcc", "clang", "llvm", "msvc", "coverity"}
@@ -88,7 +90,15 @@ def _clean_tag(source_ref):
 
 
 # --------------------------------------------------------------- Claude-from-files
-def claude_from_files(cfg, tails):
+def split_tails(all_compiled):
+    """(source_tails, header_tails) for the reconstruction call: paths compiled as
+    source vs paths only included as headers — so Claude can report per-component
+    evidence (compiled-source vs headers-only)."""
+    sources = {p for p in all_compiled if p.lower().endswith(SRC_EXT)}
+    return digest_tails(sources), digest_tails(all_compiled - sources)
+
+
+def claude_from_files(cfg, source_tails, header_tails=()):
     from pydantic import BaseModel
     from typing import List, Literal, Optional
 
@@ -97,6 +107,7 @@ def claude_from_files(cfg, tails):
         vcs_url: Optional[str]
         proposed_version: Optional[str]
         confidence: Literal["high", "medium", "low"]
+        evidence: Literal["compiled-source", "headers-only"]
         rationale: str
 
     class Result(BaseModel):
@@ -107,7 +118,8 @@ def claude_from_files(cfg, tails):
         model=MODEL, max_tokens=4000, system=SYSTEM_FROMFILES,
         messages=[{"role": "user", "content": json.dumps(
             {"instruction": "Reconstruct the components from these compiled file paths.",
-             "compiled_file_paths": tails}, indent=2)}],
+             "compiled_source_paths": list(source_tails),
+             "included_header_paths": list(header_tails)}, indent=2)}],
         output_format=Result,
     )
     return resp.parsed_output.components, resp.usage
@@ -318,7 +330,7 @@ def main():
     print(f"[bd]   {len(candidates)} components in the Black Duck BoM", flush=True)
 
     # (2) Claude reconstructs components from the compiled file paths (union).
-    comps, usage = claude_from_files(cfg, digest_tails(all_compiled))
+    comps, usage = claude_from_files(cfg, *split_tails(all_compiled))
     print(f"[claude] reconstructed {len(comps)} components (tok {usage.input_tokens}/{usage.output_tokens}):", flush=True)
     for c in comps:
         if c.name.strip().lower() in BUILD_TOOLS:
@@ -330,6 +342,7 @@ def main():
               f"{'  <-- NEW (not in BD BoM)' if new else ''}", flush=True)
         if nk and new:
             candidates[nk] = {"name": c.name, "slug": slugify(c.name), "vcs_url": c.vcs_url,
+                              "evidence": c.evidence,
                               "version": c.proposed_version, "version_source": "claude-inferred"}
 
     # (3) .git discovery: ACTUAL SOURCE (exact checkout + ref) -> GROUND TRUTH
@@ -475,6 +488,7 @@ def main():
     for c in candidates.values():
         it = {"componentName": c["name"], "componentVersionName": c.get("version") or "?",
               "vcsUrl": c["vcs_url"], "versionSource": c["version_source"],
+              "evidence": c.get("evidence"),
               "monitored_hint": c["slug"] in monitored,
               "watchRef": c.get("watch_ref"), "watchConfidence": c.get("watch_confidence"),
               "releaseStyle": c.get("release_style"), "fileScopeRef": c.get("file_scope_ref"),

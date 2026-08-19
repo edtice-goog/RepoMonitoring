@@ -27,8 +27,8 @@ from db.session import SessionLocal                                    # noqa: E
 from services import cache                                            # noqa: E402
 import repo_mapper                                                    # noqa: E402
 from attribute_capture import (BUILD_TOOLS, HDR_EXT, claude_from_files,  # noqa: E402
-                               digest_tails, fetch_fileset, norm_repo,
-                               resolve_tag, resolve_watch_refs, slugify)
+                               digest_tails, fetch_fileset, norm_repo, resolve_tag,
+                               resolve_watch_refs, slugify, split_tails)
 from bd_scout import BDClient, load_config                            # noqa: E402
 from bd_provision import (bd_ui_url, build_anthropic_client, component_context,  # noqa: E402
                           enhance_with_claude, resolve_project_version)
@@ -131,13 +131,15 @@ def recreate_project(name, out_dir, refresh_sbom=False, refresh_events=False,
                 "vcs_url": url, "version": c["componentVersionName"], "version_source": "bd"}
 
     # ---------- (3) Claude reconstruction from compiled paths (union) ----------
-    tails = digest_tails(all_compiled)
-    tails_sha = hashlib.sha256(json.dumps(tails, sort_keys=True).encode()).hexdigest()
+    source_tails, header_tails = split_tails(all_compiled)
+    tails_sha = hashlib.sha256(json.dumps([source_tails, header_tails],
+                                          sort_keys=True).encode()).hexdigest()
 
     def fromfiles_producer():
-        comps, _ = claude_from_files(cfg, tails)
+        comps, _ = claude_from_files(cfg, source_tails, header_tails)
         return [{"name": c.name, "vcs_url": c.vcs_url, "proposed_version": c.proposed_version,
-                 "confidence": c.confidence, "rationale": c.rationale} for c in comps]
+                 "confidence": c.confidence, "evidence": c.evidence,
+                 "rationale": c.rationale} for c in comps]
     fromfiles = cache.cached("fromfiles", {"tails_sha": tails_sha}, fromfiles_producer)
     for c in fromfiles:
         if (c["name"] or "").strip().lower() in BUILD_TOOLS:
@@ -145,7 +147,8 @@ def recreate_project(name, out_dir, refresh_sbom=False, refresh_events=False,
         nk = norm_repo(c["vcs_url"])
         if nk and nk not in candidates:
             candidates[nk] = {"name": c["name"], "slug": slugify(c["name"]), "vcs_url": c["vcs_url"],
-                              "version": c["proposed_version"], "version_source": "claude-inferred"}
+                              "version": c["proposed_version"], "version_source": "claude-inferred",
+                              "evidence": c.get("evidence")}
 
     # ---------- (4) provenance triple from Postgres (no live .git) ----------
     for p in provenance:
@@ -257,6 +260,7 @@ def recreate_project(name, out_dir, refresh_sbom=False, refresh_events=False,
     for c in candidates.values():
         it = {"componentName": c["name"], "componentVersionName": c.get("version") or "?",
               "vcsUrl": c["vcs_url"], "versionSource": c["version_source"],
+              "evidence": c.get("evidence"),
               "monitored_hint": c["slug"] in monitored,
               "watchRef": c.get("watch_ref"), "watchConfidence": c.get("watch_confidence"),
               "releaseStyle": c.get("release_style"), "fileScopeRef": c.get("file_scope_ref"),
