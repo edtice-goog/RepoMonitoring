@@ -81,7 +81,16 @@ Every `result` field must be present (the monitor renders them verbatim). When
 the event carried `cross_repo`, a security-relevant `recommended_action` must say
 to propagate the patch to the mirrored locations.
 
-## 4. Replay through the monitor
+## 4. Verify coverage BEFORE replaying — the fallthrough is silent and paid
+
+`/fill` live-triages every event that misses the cache, server-side, on the
+API key in `blackduck.local.json` — the chat session never sees that spend.
+So before replaying, recompute `request_key(...)` for EVERY untriaged event
+from step 1 and confirm a cache file exists for each. The counts must match
+exactly (e.g. 475 untriaged -> 475 seeded entries); a shortfall of N means N
+silent API calls. Seed the gap first.
+
+## 5. Replay through the monitor
 
 ```bash
 curl -X POST "http://127.0.0.1:8378/fill?project=<name>&mode=all"
