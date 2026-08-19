@@ -291,26 +291,22 @@ class ProjectState:
             self.results, self._seen = [], set()
 
     def replay_events(self):
-        """Re-render the durable feed and reconcile the Postgres cache with a MARK-AND-SWEEP,
-        then atomically swap the in-memory list. Reads keep seeing the previous render until
-        the swap; a stale or mis-rendered row (still pending after the re-render) is removed.
-        Triage is cache-only, so a replay costs no tokens."""
-        from db import rendered
+        """Re-render the durable feed and UPSERT into the Postgres cache, then merge
+        with rows the feed does not cover. Replay never deletes: the feed is a
+        journal that can be partial (recreated after a data-dir wipe, extended by
+        updates) and sweeping against it erased real history once. Removing rows
+        needs GIT EVIDENCE that a commit is gone - that is the audit's job
+        (phantom removal), not replay's. Triage is cache-only: no tokens."""
         records = self._load_events()
-        # A MISSING feed file is not an EMPTY feed. After a data-dir delete +
-        # recreate-from-DB, the Postgres render cache is the only copy of event
-        # history — mark-and-sweeping it against a nonexistent feed would erase
-        # it. Keep serving the rendered history; the feed grows again from
-        # 'check for updates' (cursors are in Postgres and were not lost).
-        if not records and not self._events_path().exists() and self.results:
-            return {"events": 0, "kept_rendered": len(self.results),
-                    "note": "no durable feed on disk - kept DB-rendered history"}
         new_results, new_seen = [], set()
-        rendered.mark_pending(self.project)                        # mark every row pending
         stats = self._fire_events(records, cache_only=True, sink=new_results, seen=new_seen)
-        self._persist(new_results)                                 # upsert fresh -> clears pending
-        rendered.sweep(self.project)                               # remove the still-pending stale
-        self.results, self._seen = new_results, new_seen           # atomic swap (reads saw old)
+        self._persist(new_results)                     # upsert the re-rendered rows
+        # keep everything the feed doesn't mention (newest-first order preserved)
+        kept = [r for r in self.results if r.get("commit") not in new_seen]
+        merged = sorted(new_results + kept,
+                        key=lambda r: r.get("committed_at") or "", reverse=True)
+        stats["kept_beyond_feed"] = len(kept)
+        self.results, self._seen = merged, new_seen | {r.get("commit") for r in kept}
         return stats
 
     def run_replay(self):
