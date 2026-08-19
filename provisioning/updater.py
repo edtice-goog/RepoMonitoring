@@ -194,7 +194,21 @@ def fetch_updates(project_name, watches, mode, limit=None):
                 warnings.append(f"{r['component']}: clone refresh failed; may miss new commits")
             base, last_sha = _base_for(project_name, clone, r)
             if base is None:
-                warnings.append(f"{r['component']}: could not resolve base ref")
+                # No cursor and no resolvable release ref (claude-inferred
+                # version like '?'). The honest semantic: watch FORWARD from
+                # the current branch tip - initialize the cursor there so the
+                # next check walks real new commits. No historical backfill
+                # (there is no anchor to backfill from).
+                tip = _git(clone, "rev-parse", r["branch"], check=False).stdout.strip()
+                if not tip:
+                    warnings.append(f"{r['component']}: could not resolve base ref "
+                                    f"or branch {r['branch']!r}")
+                    continue
+                tip_date = _git(clone, "show", "-s", "--format=%cI", tip,
+                                check=False).stdout.strip()
+                advances.append((r["url"], tip_date, tip))
+                warnings.append(f"{r['component']}: no resolvable release ref "
+                                f"({r['version']!r}); watching from current tip {tip[:12]}")
                 continue
             commits = _log(clone, base, r["branch"])   # oldest-first
         except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:

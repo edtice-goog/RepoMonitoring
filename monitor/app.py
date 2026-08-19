@@ -68,6 +68,14 @@ def esc(s):
     return str(s).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 
+def slug(name):
+    """Component slug — MUST stay identical to emit_local.slugify (slugs are
+    path prefixes and DOM filter values; two transforms = one component under
+    two names, e.g. 'project-everest-(hacl*/curve25519)')."""
+    out = re.sub(r"[^a-z0-9._]+", "-", (name or "").lower()).strip("-.")
+    return out or "component"
+
+
 def attr(s):
     """esc() for HTML attribute values (tooltips) — also escapes quotes."""
     return esc(s).replace("'", "&#39;").replace('"', "&quot;")
@@ -368,7 +376,7 @@ class ProjectState:
                 url = item.get("vcsUrl")
                 if not url:
                     continue
-                component = item["componentName"].lower().replace(" ", "-")
+                component = slug(item["componentName"])
                 # The provenance tag must say which signal ACTUALLY identified this
                 # repo — stamping everything sca:kb_vcs_url overstated the KB (e.g.
                 # busybox-w32, which the KB missed and Claude reconstructed).
