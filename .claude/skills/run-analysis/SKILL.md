@@ -65,7 +65,15 @@ checks under-represents the build and must be re-run, not ingested:
 - `link-units` is **non-empty** (the link step ran and was recorded).
 - The primary-file paths are real checkout paths, not copies in a staging dir.
 
-## 5. Ingest into the monitor
+## 5. Register with the monitor — writing files is NOT ingestion
+
+**The single most common mistake**: running `scripts/attribute_capture.py` (or
+`provisioning/recreate.py`) and stopping. Those scripts only write a data dir of
+JSON files; the monitor knows nothing about them and the project will NOT
+appear. The run is not done until step 6 passes. Two registration paths:
+
+**(a) Normal path — the ingestion API** (durable: Postgres-seeded, server-side
+recreate, survives restarts):
 
 ```bash
 python provisioning/ingest.py --project <bd-project-name> --version <version> \
@@ -73,14 +81,29 @@ python provisioning/ingest.py --project <bd-project-name> --version <version> \
 ```
 
 Run this on the machine where the build's source paths exist (checkout discovery
-walks the local filesystem). It POSTs the compiled file set + `.git` provenance;
-the server persists to Postgres, recreates the artifacts, and loads the project
+walks the local filesystem). The response says `"recreate": "started"`; the
+server persists to Postgres, recreates the artifacts, and loads the project
 live — **no monitor restart**. Re-basing an existing project onto a new release:
-add `--replace --reset-feed`.
+add `--replace --reset-feed`. Caveat: the server-side recreate reads the
+monitor's own `blackduck.local.json`, so this path only works for projects on
+THAT Black Duck instance.
 
-## 6. Verify
+**(b) One-off / foreign-instance path** — when the project lives on a different
+BD instance (run `attribute_capture.py` with
+`BLACKDUCK_LOCAL_CONFIG=<other-config>.json`), or a recreated data dir already
+exists, you MUST register it yourself:
 
-- `GET /health` project count went up; `GET /api/projects` lists the project.
+```bash
+curl -X POST "http://127.0.0.1:8378/projects/add?project=<name>&data_dir=<abs-path-to-data-dir>"
+```
+
+This loads it live without a restart and records it so restarts reload it.
+
+## 6. Verify — the definition of done
+
+- `GET /health` project count went up; `GET /api/projects` **lists the project**.
+  If it does not, registration did not happen — go back to step 5; do not
+  conclude the monitor needs a restart (it never does for new projects).
 - On the project page: the expected repos are **monitored** (own compiled
   sources); linked/header-only components are **reference-only**; the pinned
   ref equals the tag actually built (bold ref + struck-out label means the SCA
