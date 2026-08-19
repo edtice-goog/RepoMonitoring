@@ -723,7 +723,7 @@ class Registry:
             return
         loaded_dirs = {ps.data_dir.resolve() for ps in self.projects.values()}
 
-        def _try_load(d, why):
+        def _try_load(d, why, trusted=False):
             d = Path(d)
             if d.resolve() in loaded_dirs or not (d / "build-capture.json").exists():
                 return
@@ -732,7 +732,11 @@ class Registry:
             except Exception as exc:
                 log(f"[autoload] skip {d.name}: {exc!r}")
                 return
-            if ps.project not in db_names:
+            # The DB gate applies only to the opportunistic live-* scan: truncating the
+            # DB still gives a clean slate there. A dir remembered in the manifest was
+            # an operator's explicit POST /projects/add — reload it even without a DB
+            # seed, or add-only projects silently vanish on restart.
+            if not trusted and ps.project not in db_names:
                 log(f"[autoload] skip {d.name}: project {ps.project!r} not seeded in DB")
                 return
             if ps.project in {p.project for p in self.projects.values()}:
@@ -753,8 +757,7 @@ class Registry:
         except Exception:
             manifest = {}
         for proj, d in manifest.items():
-            if proj in db_names:
-                _try_load(d, "remembered")
+            _try_load(d, "remembered", trusted=True)
 
         # 2) fallback: any DB project still not loaded -> scan live-* for its data dir.
         if set(db_names) - {p.project for p in self.projects.values()}:
