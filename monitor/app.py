@@ -26,6 +26,7 @@ Usage:
 
 import argparse
 import json
+import re
 import sys
 import threading
 import urllib.error
@@ -67,6 +68,39 @@ def esc(s):
     return str(s).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 
+def attr(s):
+    """esc() for HTML attribute values (tooltips) — also escapes quotes."""
+    return esc(s).replace("'", "&#39;").replace('"', "&quot;")
+
+
+# Human explanations for the provenance tags shown in the watch tables. Keys are
+# the exact strings _add_watch records.
+PROV_HELP = {
+    "capture:bdcpp+mapper": ("Seen in the real Coverity (BD/CPP) build capture: this repo "
+                             "owns files the build actually compiled, attributed by the "
+                             "file-to-repo mapping service."),
+    "capture:recreate": ("Provisioned from ingested capture seeds (the compiled file set "
+                         "plus .git checkout provenance) by the recreate pipeline."),
+    "capture:gh_tree": ("Approximated from the component release tag file tree on GitHub - "
+                        "a stand-in when no real build capture exists."),
+    "sca:kb_vcs_url": ("Component identified by Black Duck SCA (KnowledgeBase BoM); its "
+                       "upstream VCS URL resolved from the KB component identity."),
+}
+
+
+def _ver_digits(v):
+    """Version equivalence for conflict detection: compare numeric runs only, so
+    v3.6.3.1 == 3.6.3.1 and curl-8_21_0 == 8.21.0, but v3.6.3.1 != 3.2.0."""
+    return re.findall(r"\d+", v or "")
+
+
+def kb_conflict(w):
+    """True when the SCA KB version label disagrees with the pinned ref we chose
+    (i.e. local ground truth overrode sca:kb). Both sides must exist."""
+    kb, pin = w.get("sca_version"), w.get("pinned_ref")
+    return bool(kb and pin and _ver_digits(kb) != _ver_digits(pin))
+
+
 # --------------------------------------------------------------- per-project state
 class ProjectState:
     def __init__(self, data_dir: Path, triage_url: str):
@@ -81,6 +115,7 @@ class ProjectState:
         self.results = []          # processed commit results, newest first
         self.project = "?"
         self.build_id = "?"
+        self.bd_project_url = None
         self.recreate_status = {"state": "idle", "summary": None, "error": None, "at": None}
         self.recreate_lock = threading.Lock()
         self.update_status = {"state": "idle", "summary": None, "error": None, "at": None}
@@ -272,6 +307,7 @@ class ProjectState:
         hub_path = self.data_dir / "hub-api-components.json"
         if hub_path.exists():
             hub = json.loads(hub_path.read_text(encoding="utf-8-sig"))
+            self.bd_project_url = hub.get("bdProjectUrl")
             for item in hub.get("items", []):
                 url = item.get("vcsUrl")
                 if not url:
@@ -290,6 +326,10 @@ class ProjectState:
                 w = self.watch_by_url.get(norm_url(url))
                 if w is not None:
                     w["version_source"] = item.get("versionSource", "bd")
+                    # Keep the KB version label so the UI can show when the locally
+                    # discovered ref overrode a conflicting sca:kb identification.
+                    if item.get("versionSource") == "bd":
+                        w["sca_version"] = item.get("componentVersionName")
                     # Provenance: we monitor the canonical, but the build may have
                     # used a local/vendored copy that diverges from it.
                     w["built_from"] = item.get("builtFrom")
@@ -965,8 +1005,17 @@ def render_project(reg: Registry, ps: ProjectState, status_filter: str = None,
     lock_poll = "<script>setTimeout(function(){location.reload();},2500);</script>" if locked else ""
 
     def _pin(w):
-        ref = (f"<code title='Immutable file-scope ref — the exact snapshot we "
-               f"enumerated files at'>{esc(w['pinned_ref'] or '—')}</code>")
+        pin_txt = esc(w["pinned_ref"] or "—")
+        if kb_conflict(w):
+            # Local ground truth won a version conflict: bold the chosen ref and
+            # show the sca:kb label it overrode.
+            ref = (f"<code title='Immutable file-scope ref — the exact snapshot we "
+                   f"enumerated files at'><b>{pin_txt}</b></code>"
+                   f" <span class='muted' title='{attr('Black Duck KB identified version ' + str(w.get('sca_version')) + ', which conflicts with the exact ref discovered in the local .git checkout; the locally discovered ref was chosen.')}'>"
+                   f"overrode sca:kb <s>{esc(w.get('sca_version'))}</s></span>")
+        else:
+            ref = (f"<code title='Immutable file-scope ref — the exact snapshot we "
+                   f"enumerated files at'>{pin_txt}</code>")
         if w.get("version_source") == "claude-inferred":
             ref += (" <span class='muted' title='Version inferred by Claude — "
                     "Black Duck did not identify this component'>≈ inferred</span>")
@@ -994,6 +1043,22 @@ def render_project(reg: Registry, ps: ProjectState, status_filter: str = None,
                   f"<code>{esc(bf)}{refpart}</code>{warn}</span>")
         return u
 
+    def _prov(w):
+        conflict = kb_conflict(w)
+        parts = []
+        for tag in w["provenance"]:
+            help_txt = PROV_HELP.get(tag, "Provenance of this watch entry.")
+            shown = esc(tag)
+            if conflict and tag.startswith("capture:"):
+                help_txt += (" This signal supplied the chosen ref - it overrode the "
+                             "conflicting sca:kb version label.")
+                shown = f"<b>{shown}</b>"
+            elif conflict and tag.startswith("sca:"):
+                help_txt += (" Its version label conflicted with the locally discovered "
+                             "ref and was overridden.")
+            parts.append(f"<span title='{attr(help_txt)}'>{shown}</span>")
+        return ", ".join(parts)
+
     def _check_cell(w):
         on = comps_on is None or w["component"] in comps_on
         return (f"<td style='text-align:center'><input type='checkbox' class='compfilter' "
@@ -1005,7 +1070,7 @@ def render_project(reg: Registry, ps: ProjectState, status_filter: str = None,
             "<tr>"
             + (_check_cell(w) if checks else "")
             + f"<td>{esc(w['component'])}</td><td>{_url(w)}</td>"
-            f"<td>{esc(w['relationship'])}</td><td>{esc(', '.join(w['provenance']))}</td>"
+            f"<td>{esc(w['relationship'])}</td><td>{_prov(w)}</td>"
             f"<td>{_pin(w)}</td><td>{_watch(w)}</td>"
             + (f"<td>{_repo_actions(w)}</td>" if actions else "")
             + "</tr>"
@@ -1244,6 +1309,7 @@ def render_project(reg: Registry, ps: ProjectState, status_filter: str = None,
     body = f"""
 <p><a href="/">&larr; Projects</a></p>
 <h1>{esc(ps.name)} <span class="muted">({esc(ps.build_id)})</span></h1>
+{f'<p style="margin-top:-6px"><a href="{esc(ps.bd_project_url)}" target="_blank" title="Open this project version in Black Duck SCA">View in Black Duck SCA &#8599;</a></p>' if ps.bd_project_url else ""}
 {lock_banner}
 <p>{recreate_html}</p>
 <p>{replay_html}</p>
