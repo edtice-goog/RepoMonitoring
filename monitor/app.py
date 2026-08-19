@@ -134,6 +134,7 @@ class ProjectState:
         self.build_id = "?"
         self.bd_project_url = None
         self.recreate_status = {"state": "idle", "summary": None, "error": None, "at": None}
+        self.audit_status = {"state": "idle", "summary": None, "error": None, "at": None}
         self.recreate_lock = threading.Lock()
         self.update_status = {"state": "idle", "summary": None, "error": None, "at": None}
         self.update_lock = threading.Lock()
@@ -579,6 +580,48 @@ class ProjectState:
                                     "error": repr(exc), "at": now_iso()}
 
     # ----------------------------------------------------------- check for updates (fetch)
+    # ----------------------------------------------------------- audit (integrity)
+    def run_audit(self, fix=False) -> None:
+        """Repo-vs-DB integrity check: walk the real <pinned>..<watch branch> range
+        from a refreshed mirror clone and diff it against the rendered history.
+        fix=True fires the missing covered-range commits (cache-only — verdicts
+        come from the redis triage cache or stay untriaged) and removes phantom
+        rows whose commits are not in the branch ancestry. Occasional-use by
+        design; this, not replay, is the divergence detector/corrector."""
+        try:
+            from provisioning.updater import audit_events
+            from db import rendered
+            db_by_comp = {}
+            for r in self.results:
+                if r.get("commit") and r.get("component"):
+                    db_by_comp.setdefault(r["component"], {})[r["commit"]] =                         r.get("committed_at") or ""
+            monitored = [w for w in self.watches if w.get("monitored")]
+            audit = audit_events(self.project, monitored, db_by_comp)
+            summary = {"report": audit["report"], "warnings": audit["warnings"],
+                       "fixed": None}
+            if fix:
+                removed = 0
+                for comp, shas in audit["phantom"].items():
+                    removed += rendered.remove(self.project, shas)
+                    dead = set(shas)
+                    self.results = [r for r in self.results
+                                    if not (r.get("component") == comp
+                                            and r.get("commit") in dead)]
+                before = len(self.results)
+                stats = self._fire_events(audit["missing_events"], cache_only=True)
+                self._persist(self.results[:len(self.results) - before])
+                existing = self._load_events()
+                seen = {e.get("commit") for e in existing}
+                self._save_events(existing + [e for e in audit["missing_events"]
+                                              if e.get("commit") not in seen])
+                summary["fixed"] = {"fired_missing": len(audit["missing_events"]),
+                                    "removed_phantoms": removed, "fire_stats": stats}
+            self.audit_status = {"state": "done", "summary": summary,
+                                 "error": None, "at": now_iso()}
+        except Exception as exc:
+            self.audit_status = {"state": "error", "summary": None,
+                                 "error": repr(exc), "at": now_iso()}
+
     def run_update(self, component=None) -> None:
         """Fetch new commits since the cursor (local git) and show them ALL — already
         triaged ones from cache, the rest yellow/untriaged. Cache-only, so NO tokens;
@@ -1309,6 +1352,43 @@ def render_project(reg: Registry, ps: ProjectState, status_filter: str = None,
         f"cursor:pointer;font-size:13px;float:right'>&#x1F5D1; Delete project</button>")
     recreate_html = f"{recreate_btn} <span style='font-size:12px'>{st}</span>{delete_btn}"
 
+    au = ps.audit_status
+    if au["state"] == "running":
+        aust = "<span style='color:#B9770E'>auditing against upstream git&hellip;</span><script>setTimeout(function(){location.reload();},3000);</script>"
+    elif au["state"] == "done":
+        rep = (au.get("summary") or {}).get("report") or []
+        bits = []
+        for e in rep:
+            ok = e.get("in_sync")
+            bits.append(f"{esc(e['component'])}: " + ("&#10003; in sync" if ok else
+                        f"<b style='color:#C0392B'>missing {e.get('missing_in_covered_range', 0)}, "
+                        f"phantom {e.get('phantom', 0)}</b>")
+                        + f" <span class='muted'>(repo {e.get('repo_commits', '?')} vs db {e.get('db_events', '?')};"
+                          f" {e.get('older_than_coverage', 0)} pre-coverage"
+                          + (f"; <b>{e['newer_than_coverage']} newer than coverage — run Check for updates</b>"
+                             if e.get('newer_than_coverage') else "") + ")</span>")
+        fx = (au.get("summary") or {}).get("fixed")
+        if fx:
+            bits.append(f"fixed: fired {fx['fired_missing']}, removed {fx['removed_phantoms']} phantom(s)")
+        aust = f"<span style='color:#2E7D32'>audited</span> &middot; " + " &middot; ".join(bits)
+    elif au["state"] == "error":
+        aust = f"<span style='color:#C0392B'>audit error: {esc(au['error'])}</span>"
+    else:
+        aust = "<span class='muted'>compare the DB event history against the real upstream git range (occasional use)</span>"
+    audit_btn = _greybtn("&#x1FA7A; Audit vs upstream") if locked else (
+        f"<button onclick=\"this.disabled=true;fetch('/audit?project={quote(ps.name)}',"
+        f"{{method:'POST'}}).then(()=>setTimeout(()=>location.reload(),1500))\" "
+        f"style='background:#7D6608;color:#fff;border:0;border-radius:4px;padding:6px 12px;"
+        f"cursor:pointer;font-size:13px'>&#x1FA7A; Audit</button>")
+    audit_fix_btn = "" if locked else (
+        f"<button onclick=\"if(confirm('Fix divergence? Missing commits are fired (cache-only, "
+        f"no tokens) and phantom events not in the branch ancestry are removed from the database.'))"
+        f"{{this.disabled=true;fetch('/audit?project={quote(ps.name)}&fix=1',"
+        f"{{method:'POST'}}).then(()=>setTimeout(()=>location.reload(),1500));}}\" "
+        f"style='background:#A04000;color:#fff;border:0;border-radius:4px;padding:6px 12px;"
+        f"cursor:pointer;font-size:13px'>&#x1F527; Audit + fix</button>")
+    audit_html = f"{audit_btn} {audit_fix_btn} <span style='font-size:12px'>{aust}</span>"
+
     # Replay: re-fire the durable events file from cache (no fetch, no tokens).
     rp = ps.replay_status
     replay_btn = _greybtn("&#x25B6; Replay cached") if locked else (
@@ -1395,6 +1475,7 @@ def render_project(reg: Registry, ps: ProjectState, status_filter: str = None,
 <p>{recreate_html}</p>
 <p>{replay_html}</p>
 <p>{update_html}</p>
+<p>{audit_html}</p>
 <p>{fill_html}</p>
 <p class="muted" style="font-size:13px"><b>Precision funnel:</b> {funnel}</p>
 <h2>Monitored repos ({len(mon)})</h2>
@@ -1500,6 +1581,24 @@ class MonitorHandler(BaseHTTPRequestHandler):
         # with the monitor — everything needed is in the body. The SBoM is NOT sent; it is
         # reloaded from the BD link and cached. Persist is synchronous; recreate+load runs
         # in the background (poll GET /api/db-projects -> add_status).
+        if parsed.path == "/audit":
+            qs = parse_qs(parsed.query)
+            project = unquote(qs["project"][0]) if "project" in qs else None
+            fix = qs.get("fix", ["0"])[0] in ("1", "true")
+            ps = self.reg.projects.get(project)
+            if ps is None:
+                self._send_json(404, {"error": f"unknown project {project}"})
+                return
+            if ps.is_locked() or ps.audit_status["state"] == "running":
+                self._send_json(409, {"status": "busy"})
+                return
+            ps.audit_status = {"state": "running", "summary": None, "error": None,
+                               "at": now_iso()}
+            threading.Thread(target=ps.run_audit, kwargs={"fix": fix},
+                             daemon=True).start()
+            self._send_json(202, {"status": "started", "project": project, "fix": fix})
+            return
+
         if parsed.path == "/projects/delete":
             qs = parse_qs(parsed.query)
             project = unquote(qs["project"][0]) if "project" in qs else None

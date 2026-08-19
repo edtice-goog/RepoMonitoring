@@ -15,8 +15,10 @@ running this skill first.
 
 ## 1. Locate the cache and enumerate the untriaged set
 
-- Cache dir: `live/triage-cache/` under the repo root unless the running triage
-  service was started with `--cache-dir` (check its command line).
+- Verdicts live in **redis** (same instance as the pipeline cache,
+  `redis://127.0.0.1:6380/0` unless `REDIS_URL` overrides), keys
+  `repomon:triage:<request-key>`. The old `live/triage-cache/` file dir is a
+  legacy migration source only — do not write files there.
 - `GET http://127.0.0.1:8378/api/results?project=<name>` → events. Untriaged =
   `triage._triage_source` is `cache-only-failsafe` or `error-failsafe` (or no
   `triage` at all) AND `in_scope` is non-empty.
@@ -43,7 +45,7 @@ when a diff is available. Batch sensibly — dozens per pass is fine.
 
 ## 3. Write cache entries the service will recognize
 
-Key and entry shape must match `request_key()` / the live-path writer in
+Key and entry shape must match `request_key()` / `cache_put()` in
 `claude_server.py` — compute the key with that exact canonicalization:
 
 ```python
@@ -55,7 +57,15 @@ def request_key(vcs_url, commit, files, cross_repo=None):
     return hashlib.sha256(canon.encode()).hexdigest()
 ```
 
-Write `<cache-dir>/<key>.json`:
+Write each entry to redis as `repomon:triage:<key>` (plain JSON string value):
+
+```python
+import redis
+r = redis.Redis.from_url("redis://127.0.0.1:6380/0", decode_responses=True)
+r.set(f"repomon:triage:{key}", json.dumps(entry))
+```
+
+Entry shape:
 
 ```json
 {
@@ -86,7 +96,7 @@ to propagate the patch to the mirrored locations.
 `/fill` live-triages every event that misses the cache, server-side, on the
 API key in `blackduck.local.json` — the chat session never sees that spend.
 So before replaying, recompute `request_key(...)` for EVERY untriaged event
-from step 1 and confirm a cache file exists for each. The counts must match
+from step 1 and confirm `r.exists(f"repomon:triage:{key}")` for each. The counts must match
 exactly (e.g. 475 untriaged -> 475 seeded entries); a shortfall of N means N
 silent API calls. Seed the gap first.
 

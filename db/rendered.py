@@ -78,6 +78,18 @@ def sweep(project_name):
     return n
 
 
+def remove(project_name, shas):
+    """Delete specific commits' rows (audit fix: phantom events not in the repo)."""
+    if not shas:
+        return 0
+    with SessionLocal() as s:
+        n = s.execute(delete(RenderedEvent)
+                      .where(RenderedEvent.project_name == project_name)
+                      .where(RenderedEvent.commit_sha.in_(list(shas)))).rowcount
+        s.commit()
+    return n
+
+
 def clear(project_name):
     """Drop the whole cache for a project (reset-feed / re-base)."""
     with SessionLocal() as s:

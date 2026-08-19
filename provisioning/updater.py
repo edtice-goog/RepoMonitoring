@@ -215,3 +215,78 @@ def fetch_updates(project_name, watches, mode, limit=None):
         advances.append((r["url"], newest["date"], newest["sha"]))
         processed += len(chosen)
     return {"events": events, "advances": advances, "processed": processed, "warnings": warnings}
+
+
+# --------------------------------------------------------------- integrity audit
+def audit_events(project_name, watches, db_by_component):
+    """Ground-truth integrity check — the operation replay never was: refresh each
+    monitored repo's mirror clone, walk the FULL <release tag>..<watch branch>
+    range from git itself (deliberately ignoring cursors), and diff that commit
+    set against the DB-rendered event history.
+
+    db_by_component: {component: {sha: committed_at_iso}} — the DB side.
+
+    Per repo, three buckets:
+      missing_covered     in the repo range, at/after the oldest DB event for the
+                          repo, absent from the DB — real gaps; fix fires these.
+      older_than_coverage in the range but before DB coverage began (backfill
+                          caps / later ingestion) — informational.
+      phantom             in the DB but NOT in the branch's ancestry — rewritten
+                          history, force-push, or mis-attributed rows; fix
+                          removes these.
+    Returns {"report": [...], "missing_events": [event-shaped, oldest-first],
+             "phantom": {component: [shas]}, "warnings": [...]}."""
+    report, missing_events, phantom, warnings = [], [], {}, []
+    for r in _repos(watches):
+        db = dict(db_by_component.get(r["component"], {}))
+        entry = {"component": r["component"], "branch": r["branch"], "db_events": len(db)}
+        try:
+            clone, fetched = ensure_clone(r["url"])
+            if not fetched:
+                warnings.append(f"{r['component']}: clone refresh failed; audit may be stale")
+            tag = _resolve_tag(clone, r["version"])
+            if tag is None:
+                warnings.append(f"{r['component']}: cannot resolve base ref "
+                                f"{r['version']!r}; skipped")
+                continue
+            commits = _log(clone, tag, r["branch"])          # oldest-first ground truth
+            ancestry = set(_git(clone, "rev-list", r["branch"], check=False)
+                           .stdout.split())                  # full branch ancestry
+        except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
+            warnings.append(f"{r['component']}: {exc}")
+            continue
+        entry.update(base=tag, repo_commits=len(commits))
+        # Covered window = [oldest, newest] DB event. Missing commits OUTSIDE it
+        # are coverage truncation, not corruption: older = pre-backfill history,
+        # newer = the cursor has not walked there yet ("Check for updates" is the
+        # remedy, and it advances the cursor properly). Only gaps INSIDE the
+        # window are integrity failures that audit-fix fires directly.
+        floor = min(db.values()) if db else None
+        ceil = max(db.values()) if db else None
+        missing_cov, older, newer = [], 0, 0
+        for c in commits:
+            if c["sha"] in db:
+                continue
+            if floor is None or c["date"] < floor:
+                older += 1
+            elif c["date"] > ceil:
+                newer += 1
+            else:
+                missing_cov.append(c)
+        ph = sorted(sha for sha in db if sha not in ancestry)
+        entry.update(missing_in_covered_range=len(missing_cov),
+                     older_than_coverage=older, newer_than_coverage=newer,
+                     phantom=len(ph),
+                     in_sync=(not missing_cov and not ph))
+        if ph:
+            phantom[r["component"]] = ph
+        for c in missing_cov:                                # event-shaped, like fetch_updates
+            missing_events.append({
+                "id": f"{r['component']}-{c['sha'][:8]}",
+                "vcs_url": f"https://github.com/{r['owner']}/{r['repo']}",
+                "branch": r["branch"], "commit": c["sha"], "message": c["subject"],
+                "committed_at": c["date"],
+                "files_changed": c["added"] + c["modified"] + c["removed"]})
+        report.append(entry)
+    return {"report": report, "missing_events": missing_events,
+            "phantom": phantom, "warnings": warnings}

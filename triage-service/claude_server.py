@@ -30,6 +30,7 @@ Usage:
 import argparse
 import hashlib
 import json
+import os
 import ssl
 import subprocess
 import sys
@@ -111,6 +112,53 @@ def gh_token() -> Optional[str]:
         return subprocess.check_output(["gh", "auth", "token"], text=True).strip()
     except Exception:
         return None
+
+
+# --------------------------------------------------------------- redis verdict cache
+# Verdicts live in the same redis the provisioning pipeline caches in — so the
+# whole system's backup story is exactly two stores: Postgres (truth) + redis
+# (recreate-for-free + retriage-for-free). The old file cache (live/triage-cache)
+# is migrated in once at startup and then no longer written.
+REDIS_URL = os.environ.get("REDIS_URL", "redis://127.0.0.1:6380/0")
+TRIAGE_PREFIX = "repomon:triage:"
+_redis = None
+
+
+def cache_backend():
+    global _redis
+    if _redis is None:
+        import redis
+        _redis = redis.Redis.from_url(REDIS_URL, decode_responses=True)
+    return _redis
+
+
+def cache_get(key: str):
+    raw = cache_backend().get(TRIAGE_PREFIX + key)
+    return json.loads(raw) if raw else None
+
+
+def cache_put(key: str, entry: dict) -> None:
+    cache_backend().set(TRIAGE_PREFIX + key, json.dumps(entry))
+
+
+def cache_count() -> int:
+    return sum(1 for _ in cache_backend().scan_iter(TRIAGE_PREFIX + "*"))
+
+
+def migrate_file_cache(cache_dir: Path) -> tuple:
+    """One-time, idempotent: import legacy file-cache entries into redis
+    (set-if-absent so redis stays authoritative). Files are left in place."""
+    imported = skipped = 0
+    for f in sorted(Path(cache_dir).glob("*.json")):
+        try:
+            entry = json.loads(f.read_text(encoding="utf-8"))
+        except (ValueError, OSError):
+            continue
+        if cache_backend().set(TRIAGE_PREFIX + f.stem, json.dumps(entry), nx=True):
+            imported += 1
+        else:
+            skipped += 1
+    return imported, skipped
 
 
 def request_key(req: dict) -> str:
@@ -239,7 +287,7 @@ class ClaudeTriageHandler(BaseHTTPRequestHandler):
         if self.path == "/health":
             self._send_json(200, {"status": "ok", "service": "triage-claude",
                                   "mode": "cache-only" if self.anthropic_client is None else "live",
-                                  "cached": len(list(self.cache_dir.glob("*.json")))})
+                                  "cached": cache_count()})
         else:
             self._send_json(404, {"error": f"unknown path {self.path}"})
 
@@ -261,11 +309,10 @@ class ClaudeTriageHandler(BaseHTTPRequestHandler):
         vcs_url, files = req.get("vcs_url"), req.get("files", [])
         cross = req.get("cross_repo") or []
         key = request_key(req)
-        cache_file = self.cache_dir / f"{key}.json"
 
         # ---- cache hit: return persisted verdict, no external calls ----
-        if cache_file.exists():
-            entry = json.loads(cache_file.read_text(encoding="utf-8"))
+        entry = cache_get(key)
+        if entry is not None:
             print(f"[triage-claude] CACHE HIT  {commit[:12]}  verdict={entry['result']['verdict']}")
             self._send_json(200, {"commit": commit, "vcs_url": vcs_url,
                                   "files_evaluated": files, "cross_repo_locations": cross,
@@ -304,8 +351,7 @@ class ClaudeTriageHandler(BaseHTTPRequestHandler):
             "created_at": now_iso(),
             "result": result,
         }
-        self.cache_dir.mkdir(parents=True, exist_ok=True)
-        cache_file.write_text(json.dumps(entry, indent=2), encoding="utf-8")
+        cache_put(key, entry)
         print(f"[triage-claude] LIVE  {commit[:12]}  verdict={result['verdict']}  "
               f"src={source}  tok={usage['input_tokens']}/{usage['output_tokens']}  -> cached")
         self._send_json(200, {"commit": commit, "vcs_url": vcs_url,
@@ -333,7 +379,11 @@ def main() -> None:
     args = ap.parse_args()
     MODEL = args.model
     ClaudeTriageHandler.cache_dir = args.cache_dir
-    args.cache_dir.mkdir(parents=True, exist_ok=True)
+    if args.cache_dir.exists():
+        imported, skipped = migrate_file_cache(args.cache_dir)
+        if imported:
+            print(f"[triage-claude] migrated {imported} file-cache entries into redis "
+                  f"({skipped} already present)")
 
     if args.cache_only:
         ClaudeTriageHandler.anthropic_client = None
@@ -347,9 +397,9 @@ def main() -> None:
         ClaudeTriageHandler.gh_token_val = gh_token()
         mode = f"live ({MODEL}); github={'yes' if ClaudeTriageHandler.gh_token_val else 'no-degrade'}"
 
-    cached = len(list(args.cache_dir.glob("*.json")))
+    cached = cache_count()
     print(f"[triage-claude] serving on http://127.0.0.1:{args.port}  mode={mode}  "
-          f"cache={args.cache_dir} ({cached} entries)")
+          f"cache=redis {REDIS_URL} ({cached} verdicts; legacy dir {args.cache_dir})")
     HTTPServer(("127.0.0.1", args.port), ClaudeTriageHandler).serve_forever()
 
 
