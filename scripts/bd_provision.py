@@ -102,7 +102,7 @@ def bd_ui_url(base_url: str, proj: dict, ver: dict) -> str:
     hrefs from _meta are not clickable for a person)."""
     pid = meta_href(proj).rstrip("/").rsplit("/", 1)[-1]
     vid = meta_href(ver).rstrip("/").rsplit("/", 1)[-1]
-    return f"{base_url.rstrip('/')}/projects/{pid}/versions/{vid}/components"
+    return f"{base_url.rstrip('/')}/api/projects/{pid}/versions/{vid}/components"
 
 
 def component_context(comps: list) -> list:
