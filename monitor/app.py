@@ -85,7 +85,16 @@ PROV_HELP = {
                         "a stand-in when no real build capture exists."),
     "sca:kb_vcs_url": ("Component identified by Black Duck SCA (KnowledgeBase BoM); its "
                        "upstream VCS URL resolved from the KB component identity."),
+    "claude:from-files": ("Component the SCA KB did NOT identify - reconstructed by Claude "
+                          "from the compiled file paths (version is a best estimate)."),
+    "git:checkout": ("Identified from the .git checkout the build actually used - ground "
+                     "truth for repo and exact built ref."),
 }
+
+
+# Which provenance tag corresponds to the source that identified/tracks the repo.
+VSRC_TAG = {"bd": "sca:kb_vcs_url", "claude-inferred": "claude:from-files",
+            "git-discovered": "git:checkout"}
 
 
 def _ver_digits(v):
@@ -99,6 +108,19 @@ def kb_conflict(w):
     (i.e. local ground truth overrode sca:kb). Both sides must exist."""
     kb, pin = w.get("sca_version"), w.get("pinned_ref")
     return bool(kb and pin and _ver_digits(kb) != _ver_digits(pin))
+
+
+def state_stamp(ps) -> str:
+    """Cheap fingerprint of everything the project page renders from. The page
+    polls this instead of blind-reloading (which killed tooltips and text
+    selection): when the stamp changes, a banner OFFERS a reload."""
+    import hashlib
+    parts = [str(len(ps.results)),
+             (ps.results[0].get("commit", "") if ps.results else ""),
+             *(str((getattr(ps, a)["at"], getattr(ps, a)["state"])) for a in
+               ("recreate_status", "replay_status", "update_status",
+                "fill_status", "audit_status"))]
+    return hashlib.sha1("|".join(parts).encode()).hexdigest()[:16]
 
 
 def bd_server_for(ps):
@@ -339,11 +361,18 @@ class ProjectState:
                 if not url:
                     continue
                 component = item["componentName"].lower().replace(" ", "-")
+                # The provenance tag must say which signal ACTUALLY identified this
+                # repo — stamping everything sca:kb_vcs_url overstated the KB (e.g.
+                # busybox-w32, which the KB missed and Claude reconstructed).
+                vsrc = item.get("versionSource", "bd")
+                prov_tag = {"bd": "sca:kb_vcs_url",
+                            "claude-inferred": "claude:from-files",
+                            "git-discovered": "git:checkout"}.get(vsrc, f"sca:{vsrc}")
                 self._add_watch(
                     url=url,
                     component=component,
                     relationship="upstream",
-                    provenance="sca:kb_vcs_url",
+                    provenance=prov_tag,
                     pinned_ref=item.get("componentVersionName"),
                 )
                 # Record where the version came from so the UI can flag inferred
@@ -1119,7 +1148,7 @@ def render_project(reg: Registry, ps: ProjectState, status_filter: str = None,
                    "Replay/recreate in progress — actions are locked; the current render is "
                    "still being served and this page refreshes automatically.</div>") if locked else ""
     # While locked, poll: reload so the buttons re-enable the moment the reconcile finishes.
-    lock_poll = "<script>setTimeout(function(){location.reload();},2500);</script>" if locked else ""
+    lock_poll = ""   # periodic reloads killed tooltips/selection; the stamp poller below offers a reload instead
 
     def _pin(w):
         pin_txt = esc(w["pinned_ref"] or "—")
@@ -1162,6 +1191,10 @@ def render_project(reg: Registry, ps: ProjectState, status_filter: str = None,
 
     def _prov(w):
         conflict = kb_conflict(w)
+        # The authoritative tag: on a version conflict the capture side won; else
+        # whichever signal identified the component (version_source) is the one
+        # actually tracking this repo - always bold it, so a KB miss is visible.
+        authoritative = VSRC_TAG.get(w.get("version_source"))
         parts = []
         for tag in w["provenance"]:
             help_txt = PROV_HELP.get(tag, "Provenance of this watch entry.")
@@ -1173,6 +1206,9 @@ def render_project(reg: Registry, ps: ProjectState, status_filter: str = None,
             elif conflict and tag.startswith("sca:"):
                 help_txt += (" Its version label conflicted with the locally discovered "
                              "ref and was overridden.")
+            elif not conflict and tag == authoritative:
+                help_txt += " This is the signal that identified this component (bolded)."
+                shown = f"<b>{shown}</b>"
             parts.append(f"<span title='{attr(help_txt)}'>{shown}</span>")
         return ", ".join(parts)
 
@@ -1354,7 +1390,7 @@ def render_project(reg: Registry, ps: ProjectState, status_filter: str = None,
 
     au = ps.audit_status
     if au["state"] == "running":
-        aust = "<span style='color:#B9770E'>auditing against upstream git&hellip;</span><script>setTimeout(function(){location.reload();},3000);</script>"
+        aust = "<span style='color:#B9770E'>auditing against upstream git&hellip;</span>"
     elif au["state"] == "done":
         rep = (au.get("summary") or {}).get("report") or []
         bits = []
@@ -1486,6 +1522,23 @@ def render_project(reg: Registry, ps: ProjectState, status_filter: str = None,
 {filter_bar}
 {cards}
 <script>
+var PAGE_STAMP='{state_stamp(ps)}';
+(function(){{
+  var bar=document.createElement('div');
+  bar.style.cssText='display:none;position:fixed;top:10px;right:10px;z-index:99;'+
+    'background:#1A5276;color:#fff;padding:8px 14px;border-radius:6px;font-size:13px;'+
+    'box-shadow:0 2px 8px rgba(0,0,0,.3)';
+  bar.innerHTML='data changed &nbsp;<button onclick="location.reload()" '+
+    'style="background:#fff;color:#1A5276;border:0;border-radius:4px;padding:3px 10px;'+
+    'cursor:pointer;font-size:13px">&#x27F3; Reload</button>';
+  document.body.appendChild(bar);
+  setInterval(function(){{
+    fetch('/api/state?project='+encodeURIComponent({json.dumps(ps.name)}))
+      .then(function(r){{return r.json();}})
+      .then(function(b){{ if(b.stamp && b.stamp!==PAGE_STAMP) bar.style.display='block'; }})
+      .catch(function(){{}});
+  }}, 3000);
+}})();
 function doRecreate(p){{
   fetch('/recreate?project='+p,{{method:'POST'}}).then(function(r){{
     if(r.status===428){{
@@ -1557,6 +1610,13 @@ class MonitorHandler(BaseHTTPRequestHandler):
         elif parsed.path == "/health":
             self._send_json(200, {"status": "ok", "service": "repo-monitor",
                                   "projects": len(self.reg.projects)})
+        elif parsed.path == "/api/state":
+            ps = self.reg.projects.get(project)
+            if ps is None:
+                self._send_json(404, {"error": f"unknown project {project}"})
+            else:
+                self._send_json(200, {"stamp": state_stamp(ps),
+                                      "locked": ps.is_locked()})
         elif parsed.path == "/api/projects":
             self._send_json(200, [p.summary() for p in self.reg.projects.values()])
         elif parsed.path == "/api/db-projects":
