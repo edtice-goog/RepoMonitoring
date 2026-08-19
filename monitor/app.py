@@ -268,6 +268,14 @@ class ProjectState:
         Triage is cache-only, so a replay costs no tokens."""
         from db import rendered
         records = self._load_events()
+        # A MISSING feed file is not an EMPTY feed. After a data-dir delete +
+        # recreate-from-DB, the Postgres render cache is the only copy of event
+        # history — mark-and-sweeping it against a nonexistent feed would erase
+        # it. Keep serving the rendered history; the feed grows again from
+        # 'check for updates' (cursors are in Postgres and were not lost).
+        if not records and not self._events_path().exists() and self.results:
+            return {"events": 0, "kept_rendered": len(self.results),
+                    "note": "no durable feed on disk - kept DB-rendered history"}
         new_results, new_seen = [], set()
         rendered.mark_pending(self.project)                        # mark every row pending
         stats = self._fire_events(records, cache_only=True, sink=new_results, seen=new_seen)
@@ -792,6 +800,52 @@ class Registry:
             return True
         return False
 
+    def delete_project(self, name):
+        """Remove a project from every layer: the live registry, its Postgres rows
+        (project cascades captures/files/provenance; cursors + render cache are
+        keyed by name), the loaded-dirs manifest entry, and the on-disk data dir
+        (a regenerable cache once the DB holds the seeds). The BD SCA project and
+        the triage cache are deliberately untouched — verdicts are keyed by
+        commit content and stay valid if the project is ever re-ingested."""
+        removed = {"registry": False, "db": False, "cursors": 0, "rendered": 0,
+                   "data_dir": None, "manifest": False}
+        ps = self.projects.pop(name, None)
+        removed["registry"] = ps is not None
+        try:
+            from db.session import SessionLocal
+            from db.models import Project, EventCursor
+            from db import rendered
+            with SessionLocal() as sess:
+                row = sess.query(Project).filter_by(name=name).one_or_none()
+                if row is not None:
+                    sess.delete(row)
+                    removed["db"] = True
+                removed["cursors"] = sess.query(EventCursor)                     .filter_by(project_name=name).delete()
+                sess.commit()
+            removed["rendered"] = rendered.clear(name)
+        except Exception as exc:
+            removed["db_error"] = repr(exc)
+        try:
+            m = json.loads(LOADED_MANIFEST.read_text(encoding="utf-8"))                 if LOADED_MANIFEST.exists() else {}
+            if name in m:
+                del m[name]
+                LOADED_MANIFEST.write_text(json.dumps(m, indent=2), encoding="utf-8")
+                removed["manifest"] = True
+        except Exception:
+            pass
+        if ps is not None:
+            d = ps.data_dir.resolve()
+            # Only ever delete a data dir that is inside the repo and looks like
+            # one of ours (has a build-capture.json) — never the repo root, never
+            # live/ (stage-2 artifacts + the triage cache live there).
+            if (REPO_ROOT.resolve() in d.parents and d.name.startswith("live-")
+                    and (d / "build-capture.json").exists()):
+                import shutil
+                shutil.rmtree(d, ignore_errors=True)
+                removed["data_dir"] = str(d)
+        print(f"[delete] {name}: {removed}", flush=True)
+        return removed
+
     def run_add(self, project_name, data_dir=None):
         """Load an ALREADY-recreated project data dir into the running monitor. The
         analysis script (ingest -> recreate) writes the data dir, then calls
@@ -1245,7 +1299,15 @@ def render_project(reg: Registry, ps: ProjectState, status_filter: str = None,
         f"<button onclick=\"this.disabled=true;doRecreate('{quote(ps.name)}')\" "
         f"style='background:#582C83;color:#fff;border:0;border-radius:4px;padding:6px 12px;"
         f"cursor:pointer;font-size:13px'>&#x1F504; Recreate</button>")
-    recreate_html = f"{recreate_btn} <span style='font-size:12px'>{st}</span>"
+    delete_btn = (
+        f"<button onclick=\"if(confirm('Delete project {esc(ps.name)}? Removes it from the "
+        f"monitor, deletes its database rows and local data dir. The Black Duck SCA project "
+        f"and the triage cache are NOT touched. A re-ingest restores it.'))"
+        f"{{this.disabled=true;fetch('/projects/delete?project={quote(ps.name)}',"
+        f"{{method:'POST'}}).then(()=>location.href='/');}}\" "
+        f"style='background:#C0392B;color:#fff;border:0;border-radius:4px;padding:6px 12px;"
+        f"cursor:pointer;font-size:13px;float:right'>&#x1F5D1; Delete project</button>")
+    recreate_html = f"{recreate_btn} <span style='font-size:12px'>{st}</span>{delete_btn}"
 
     # Replay: re-fire the durable events file from cache (no fetch, no tokens).
     rp = ps.replay_status
@@ -1438,6 +1500,21 @@ class MonitorHandler(BaseHTTPRequestHandler):
         # with the monitor — everything needed is in the body. The SBoM is NOT sent; it is
         # reloaded from the BD link and cached. Persist is synchronous; recreate+load runs
         # in the background (poll GET /api/db-projects -> add_status).
+        if parsed.path == "/projects/delete":
+            qs = parse_qs(parsed.query)
+            project = unquote(qs["project"][0]) if "project" in qs else None
+            if not project:
+                self._send_json(400, {"error": "missing project"})
+                return
+            ps = self.reg.projects.get(project)
+            if ps is not None and ps.is_locked():
+                self._send_json(409, {"status": "busy",
+                                      "reason": "replay/recreate in progress; try again shortly"})
+                return
+            self._send_json(200, {"status": "deleted", "project": project,
+                                  "removed": self.reg.delete_project(project)})
+            return
+
         if parsed.path == "/bd-credential":
             try:
                 length = int(self.headers.get("Content-Length", 0))
