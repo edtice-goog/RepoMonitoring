@@ -123,6 +123,12 @@ def state_stamp(ps) -> str:
     return hashlib.sha1("|".join(parts).encode()).hexdigest()[:16]
 
 
+def registry_stamp(reg) -> str:
+    import hashlib
+    parts = [f"{n}:{state_stamp(p)}" for n, p in sorted(reg.projects.items())]
+    return hashlib.sha1("|".join(parts).encode()).hexdigest()[:16]
+
+
 def bd_server_for(ps):
     """The BD server origin a project reads its BoM from: the ingested
     Project.bd_project_url when DB-seeded, else the manifest's bdProjectUrl.
@@ -1029,9 +1035,35 @@ _STYLE = """
 
 
 def _page(title: str, body: str) -> bytes:
+    # NO meta refresh: blind reloads killed tooltips and text selection. Pages
+    # that need liveness embed _stamp_poller(), which offers a reload on change.
     return (f"""<!DOCTYPE html>
-<html><head><meta charset="utf-8"><meta http-equiv="refresh" content="3">
+<html><head><meta charset="utf-8">
 <title>{esc(title)}</title><style>{_STYLE}</style></head><body>{body}</body></html>""").encode("utf-8")
+
+
+def _stamp_poller(stamp: str, state_url: str) -> str:
+    """Poll `state_url` every 3s; when its stamp differs from the rendered one,
+    show a fixed banner OFFERING a reload — never reload on our own."""
+    return f"""<script>
+(function(){{
+  var PAGE_STAMP={json.dumps(stamp)};
+  var bar=document.createElement('div');
+  bar.style.cssText='display:none;position:fixed;top:10px;right:10px;z-index:99;'+
+    'background:#1A5276;color:#fff;padding:8px 14px;border-radius:6px;font-size:13px;'+
+    'box-shadow:0 2px 8px rgba(0,0,0,.3)';
+  bar.innerHTML='data changed &nbsp;<button onclick="location.reload()" '+
+    'style="background:#fff;color:#1A5276;border:0;border-radius:4px;padding:3px 10px;'+
+    'cursor:pointer;font-size:13px">&#x27F3; Reload</button>';
+  document.body.appendChild(bar);
+  setInterval(function(){{
+    fetch({json.dumps(state_url)})
+      .then(function(r){{return r.json();}})
+      .then(function(b){{ if(b.stamp && b.stamp!==PAGE_STAMP) bar.style.display='block'; }})
+      .catch(function(){{}});
+  }}, 3000);
+}})();
+</script>"""
 
 
 def render_project_list(reg: Registry) -> bytes:
@@ -1061,7 +1093,8 @@ watched repositories and the upstream commit events being triaged. Triage backen
 <tr><th>Project</th><th>Components</th><th>Monitored</th><th>Reference-only</th>
 <th>Events</th><th>Response&nbsp;req.</th><th>Needs&nbsp;review</th><th>Untriaged</th><th>Last activity</th></tr>
 {rows}</table>"""
-    return _page("RepoMonitoring — projects", body)
+    return _page("RepoMonitoring — projects",
+                 body + _stamp_poller(registry_stamp(reg), "/api/state"))
 
 
 _LABEL_COLOR = {
@@ -1522,23 +1555,6 @@ def render_project(reg: Registry, ps: ProjectState, status_filter: str = None,
 {filter_bar}
 {cards}
 <script>
-var PAGE_STAMP='{state_stamp(ps)}';
-(function(){{
-  var bar=document.createElement('div');
-  bar.style.cssText='display:none;position:fixed;top:10px;right:10px;z-index:99;'+
-    'background:#1A5276;color:#fff;padding:8px 14px;border-radius:6px;font-size:13px;'+
-    'box-shadow:0 2px 8px rgba(0,0,0,.3)';
-  bar.innerHTML='data changed &nbsp;<button onclick="location.reload()" '+
-    'style="background:#fff;color:#1A5276;border:0;border-radius:4px;padding:3px 10px;'+
-    'cursor:pointer;font-size:13px">&#x27F3; Reload</button>';
-  document.body.appendChild(bar);
-  setInterval(function(){{
-    fetch('/api/state?project='+encodeURIComponent({json.dumps(ps.name)}))
-      .then(function(r){{return r.json();}})
-      .then(function(b){{ if(b.stamp && b.stamp!==PAGE_STAMP) bar.style.display='block'; }})
-      .catch(function(){{}});
-  }}, 3000);
-}})();
 function doRecreate(p){{
   fetch('/recreate?project='+p,{{method:'POST'}}).then(function(r){{
     if(r.status===428){{
@@ -1572,7 +1588,7 @@ function toggleAllComp(src){{
   applyCompFilter();
 }}
 </script>
-{lock_poll}"""
+{lock_poll}{_stamp_poller(state_stamp(ps), f"/api/state?project={quote(ps.name)}")}"""
     return _page(f"RepoMonitoring — {ps.name}", body)
 
 
@@ -1611,12 +1627,15 @@ class MonitorHandler(BaseHTTPRequestHandler):
             self._send_json(200, {"status": "ok", "service": "repo-monitor",
                                   "projects": len(self.reg.projects)})
         elif parsed.path == "/api/state":
-            ps = self.reg.projects.get(project)
-            if ps is None:
-                self._send_json(404, {"error": f"unknown project {project}"})
+            if not project:
+                self._send_json(200, {"stamp": registry_stamp(self.reg)})
             else:
-                self._send_json(200, {"stamp": state_stamp(ps),
-                                      "locked": ps.is_locked()})
+                ps = self.reg.projects.get(project)
+                if ps is None:
+                    self._send_json(404, {"error": f"unknown project {project}"})
+                else:
+                    self._send_json(200, {"stamp": state_stamp(ps),
+                                          "locked": ps.is_locked()})
         elif parsed.path == "/api/projects":
             self._send_json(200, [p.summary() for p in self.reg.projects.values()])
         elif parsed.path == "/api/db-projects":
