@@ -336,12 +336,18 @@ class ProjectState:
 
         # Watch manifest from capture-detected repos (forks AND upstreams) ...
         for repo in capture.get("repos_detected", []):
+            # found_in names the pipeline that WROTE the entry, not the signal
+            # that identified the repo. A repo with built_from provenance was
+            # identified by the .git checkout itself - say so.
+            cap_tag = ("git:checkout" if repo.get("built_from")
+                       else f"capture:{repo.get('vcs_urls', [{}])[0].get('found_in', '?')}")
             for v in repo.get("vcs_urls", []):
                 self._add_watch(
                     url=v["url"],
                     component=repo.get("associated_component", "?"),
                     relationship=v.get("relationship", "?"),
-                    provenance=f"capture:{v.get('found_in', '?')}",
+                    provenance=cap_tag if repo.get("built_from")
+                               else f"capture:{v.get('found_in', '?')}",
                     pinned_ref=repo.get("pinned_ref"),
                 )
                 # The moving WATCH ref (branch) is distinct from the immutable
@@ -1043,23 +1049,32 @@ def _page(title: str, body: str) -> bytes:
 
 
 def _stamp_poller(stamp: str, state_url: str) -> str:
-    """Poll `state_url` every 3s; when its stamp differs from the rendered one,
-    show a fixed banner OFFERING a reload — never reload on our own."""
+    """Poll `state_url` every 3s. A status pill is ALWAYS visible: grey
+    'up to date' normally, switching to an active 'data changed - Reload'
+    offer when the server's stamp differs. Never reloads on its own."""
     return f"""<script>
 (function(){{
   var PAGE_STAMP={json.dumps(stamp)};
   var bar=document.createElement('div');
-  bar.style.cssText='display:none;position:fixed;top:10px;right:10px;z-index:99;'+
-    'background:#1A5276;color:#fff;padding:8px 14px;border-radius:6px;font-size:13px;'+
-    'box-shadow:0 2px 8px rgba(0,0,0,.3)';
-  bar.innerHTML='data changed &nbsp;<button onclick="location.reload()" '+
-    'style="background:#fff;color:#1A5276;border:0;border-radius:4px;padding:3px 10px;'+
-    'cursor:pointer;font-size:13px">&#x27F3; Reload</button>';
+  bar.style.cssText='position:fixed;top:10px;right:10px;z-index:99;'+
+    'padding:6px 12px;border-radius:14px;font-size:12px;'+
+    'box-shadow:0 1px 4px rgba(0,0,0,.25);transition:background .3s';
+  function idle(){{
+    bar.style.background='#ECF0F1'; bar.style.color='#7F8C8D';
+    bar.innerHTML='&#10003; up to date';
+  }}
+  function changed(){{
+    bar.style.background='#1A5276'; bar.style.color='#fff';
+    bar.innerHTML='data changed &nbsp;<button onclick="location.reload()" '+
+      'style="background:#fff;color:#1A5276;border:0;border-radius:4px;'+
+      'padding:2px 9px;cursor:pointer;font-size:12px">&#x27F3; Reload</button>';
+  }}
+  idle();
   document.body.appendChild(bar);
   setInterval(function(){{
     fetch({json.dumps(state_url)})
       .then(function(r){{return r.json();}})
-      .then(function(b){{ if(b.stamp && b.stamp!==PAGE_STAMP) bar.style.display='block'; }})
+      .then(function(b){{ if(b.stamp && b.stamp!==PAGE_STAMP) changed(); }})
       .catch(function(){{}});
   }}, 3000);
 }})();
@@ -1232,7 +1247,7 @@ def render_project(reg: Registry, ps: ProjectState, status_filter: str = None,
         for tag in w["provenance"]:
             help_txt = PROV_HELP.get(tag, "Provenance of this watch entry.")
             shown = esc(tag)
-            if conflict and tag.startswith("capture:"):
+            if conflict and tag.startswith(("capture:", "git:")):
                 help_txt += (" This signal supplied the chosen ref - it overrode the "
                              "conflicting sca:kb version label.")
                 shown = f"<b>{shown}</b>"
@@ -1559,8 +1574,7 @@ function doRecreate(p){{
   fetch('/recreate?project='+p,{{method:'POST'}}).then(function(r){{
     if(r.status===428){{
       return r.json().then(function(b){{
-        var t=prompt('The monitor has no read credential for '+b.server+'.
-'+
+        var t=prompt('The monitor has no read credential for '+b.server+'. '+
                      'Paste a Black Duck API token with read access (stored server-side '+
                      'in bd-credentials.local.json for future recreates):');
         if(!t){{location.reload();return;}}
