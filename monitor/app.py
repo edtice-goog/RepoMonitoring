@@ -765,6 +765,23 @@ class ProjectState:
         self.fill_status = {"state": "done", "preview": None, "error": None, "at": now_iso(),
                             "summary": stats}
 
+    def persist_vuln_counts(self, component, counts, source=None):
+        """Write freshly-learned BD counts into the on-disk manifest so a
+        monitor restart keeps them without waiting for the next SCA refresh."""
+        p = self.data_dir / "hub-api-components.json"
+        try:
+            hub = json.loads(p.read_text(encoding="utf-8-sig"))
+            for item in hub.get("items", []):
+                if slug(item.get("componentName", "")) == component:
+                    item["vulnCounts"] = counts
+                    if source:
+                        item["vulnCountsSource"] = source
+                    p.write_text(json.dumps(hub, indent=2), encoding="utf-8")
+                    return True
+        except Exception:
+            pass
+        return False
+
     # ----------------------------------------------------------- OSV cross-check (no tokens)
     def run_osv(self, component=None, force=False) -> None:
         """Cross-check monitored events against OSV.dev: is this commit a
@@ -1362,12 +1379,25 @@ def render_project(reg: Registry, ps: ProjectState, status_filter: str = None,
         # cached BoM snapshot predates the field; a Recreate refreshes it.
         vc = w.get("vuln_counts")
         if vc is None:
+            # No count: offer the explicit KB-add path when the project has a
+            # BD association. The button's failure mode is honest — a component
+            # absent from the KB reports so, with support-ticket guidance.
+            btn = ""
+            if ps.bd_project_url and not locked:
+                btn = (f"<button onclick=\"bomAdd('{quote(ps.name)}',"
+                       f"'{quote(w['component'])}',this)\" title='search the Black "
+                       f"Duck KB for this component and add the best match to the "
+                       f"project&#39;s BoM in BD SCA' style='background:#1A5276;"
+                       f"color:#fff;border:0;border-radius:3px;padding:2px 7px;"
+                       f"cursor:pointer;font-size:11px;margin-left:6px'>+ BD BoM</button>")
             return ("<td class='muted' title='no BD SCA count available — the component "
                     "did not match the BoM by name, or the BoM has not been refreshed "
-                    "(Recreate) since this field was added'>&mdash;</td>")
+                    "(Refresh SCA data) since this field was added'>&mdash;" + btn + "</td>")
+        src = w.get("vuln_counts_source")
+        src_attr = f" title='{attr(src)}'" if src else ""
         total = sum(vc.values())
         if not total:
-            return "<td class='muted'>0</td>"
+            return f"<td class='muted'{src_attr}>0</td>"
         sev = " ".join(
             f"<span style='color:{c};font-weight:600'>{vc[k]} {lbl}</span>"
             for k, c, lbl in (("CRITICAL", "#C0392B", "crit"), ("HIGH", "#E67E22", "high"),
@@ -1376,7 +1406,7 @@ def render_project(reg: Registry, ps: ProjectState, status_filter: str = None,
         t = (f"<a href='{esc(ps.bd_project_url)}' target='_blank' "
              f"style='color:inherit'><b>{total}</b></a>" if ps.bd_project_url
              else f"<b>{total}</b>")
-        return f"<td>{t} <span style='font-size:12px'>({sev})</span></td>"
+        return f"<td{src_attr}>{t} <span style='font-size:12px'>({sev})</span></td>"
 
     def _rows(ws, actions=False, checks=False):
         return "".join(
@@ -1827,6 +1857,16 @@ function doRecreate(p){{
     setTimeout(function(){{location.reload();}},500);
   }});
 }}
+function bomAdd(p, c, btn){{
+  var name = decodeURIComponent(c);
+  if(!confirm('Search the Black Duck KB for "'+name+'" and add the best match to '+
+              'this project\'s BoM in Black Duck SCA? This modifies the BD project.')) return;
+  btn.disabled=true; btn.textContent='adding…';
+  fetch('/bom-add?project='+p+'&component='+c,{{method:'POST'}})
+    .then(function(r){{return r.json();}})
+    .then(function(b){{alert(b.message||JSON.stringify(b)); location.reload();}})
+    .catch(function(e){{alert('BoM add failed: '+e); location.reload();}});
+}}
 function applyCompFilter(){{
   var boxes=[].slice.call(document.querySelectorAll('.compfilter'));
   var on=boxes.filter(function(b){{return b.checked;}}).map(function(b){{return b.value;}});
@@ -2074,6 +2114,66 @@ class MonitorHandler(BaseHTTPRequestHandler):
             threading.Thread(target=ps.run_update, kwargs={"component": component},
                              daemon=True).start()
             self._send_json(202, {"status": "started"})
+            return
+
+        # UI action: search the BD KB for one watch's component and add the
+        # best match to the project's BoM. Explicit + confirmed in the UI;
+        # synchronous (a handful of BD calls). The truthful not-in-KB outcome
+        # comes back as added:false with the support-ticket guidance.
+        if parsed.path == "/bom-add":
+            qs = parse_qs(parsed.query)
+            project = unquote(qs["project"][0]) if "project" in qs else None
+            component = unquote(qs["component"][0]) if "component" in qs else None
+            ps = self.reg.projects.get(project)
+            if ps is None:
+                self._send_json(404, {"added": False,
+                                      "message": f"unknown project {project}"})
+                return
+            w = ps.watch_by_component.get(component)
+            if w is None:
+                self._send_json(404, {"added": False,
+                                      "message": f"unknown component {component}"})
+                return
+            if ps.is_locked():
+                self._send_json(409, {"added": False,
+                                      "message": "project busy (replay/recreate); retry shortly"})
+                return
+            from services import bd_credentials, kb_bom
+            server = bd_server_for(ps)
+            if not server:
+                self._send_json(400, {"added": False, "message":
+                                      "this project has no BD SCA association — "
+                                      "nothing to add a component to"})
+                return
+            cred = bd_credentials.resolve(server)
+            if cred is None:
+                self._send_json(428, {"added": False, "status": "needs_credential",
+                                      "server": server, "message":
+                                      f"no stored BD credential for {server} — "
+                                      "run Refresh SCA data once to store one"})
+                return
+            bd_version = ps.build_id.split("@", 1)[1] if "@" in ps.build_id else None
+            if not bd_version:
+                self._send_json(400, {"added": False, "message":
+                                      f"cannot derive BD version from build id {ps.build_id!r}"})
+                return
+            try:
+                res = kb_bom.add_watch_to_bom(
+                    server, cred["api_token"], cred.get("insecure_tls", False),
+                    ps.project, bd_version, w["component"], w.get("url"),
+                    w.get("pinned_ref"))
+            except Exception as exc:
+                self._send_json(502, {"added": False,
+                                      "message": f"BoM add failed: {exc}"})
+                return
+            if res.get("added"):
+                w["vuln_counts"] = res.get("vuln_counts")
+                w["vuln_counts_source"] = ("bom:monitor-added"
+                                           + (" (version approximate)"
+                                              if res.get("approximate") else ""))
+                ps.persist_vuln_counts(w["component"], res.get("vuln_counts"),
+                                       w["vuln_counts_source"])
+            self._send_json(200, res)
             return
 
         # UI action: cross-check events against OSV.dev (no tokens; local git +
