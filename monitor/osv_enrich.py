@@ -210,7 +210,8 @@ def _batch_parents(clone_dir, shas):
                         "--no-walk=unsorted", "--parents", "--ignore-missing",
                         "--stdin"],
                        input="\n".join(shas) + "\n",
-                       capture_output=True, text=True, timeout=300)
+                       capture_output=True, text=True, timeout=300,
+                       encoding="utf-8", errors="replace")
     if r.returncode != 0:
         raise OSVError(f"git rev-list failed in {clone_dir}: {r.stderr.strip()[:200]}")
     out = {}
