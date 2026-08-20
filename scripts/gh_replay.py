@@ -58,7 +58,8 @@ def gh_token() -> str:
     if tok:
         return tok
     try:
-        return subprocess.check_output(["gh", "auth", "token"], text=True).strip()
+        return subprocess.check_output(["gh", "auth", "token"], text=True,
+                                       encoding="utf-8", errors="replace").strip()
     except Exception:
         sys.exit("no GitHub token: set GITHUB_TOKEN or run `gh auth login`")
 
