@@ -1860,7 +1860,7 @@ function doRecreate(p){{
 function bomAdd(p, c, btn){{
   var name = decodeURIComponent(c);
   if(!confirm('Search the Black Duck KB for "'+name+'" and add the best match to '+
-              'this project\'s BoM in Black Duck SCA? This modifies the BD project.')) return;
+              'the BoM of this project in Black Duck SCA? This modifies the BD project.')) return;
   btn.disabled=true; btn.textContent='adding…';
   fetch('/bom-add?project='+p+'&component='+c,{{method:'POST'}})
     .then(function(r){{return r.json();}})
