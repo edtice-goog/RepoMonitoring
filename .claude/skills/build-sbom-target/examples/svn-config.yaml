@@ -1,0 +1,9 @@
+project_name: repo-mon-svn
+project_version: 1.14.5
+bd_url: https://sca.field-test.blackduck.com/
+build_dir: C:\Data\repo-monitoring-workspace\svn-capture
+build_cmd: C:\Data\repo-monitoring-workspace\svn-capture\build_stack.bat
+coverity_root: C:\Coverity\cov-analysis-win64-2026.3.0
+output_dir: C:\Data\repo-monitoring-workspace\bdcpp-output-svn
+modes: sig,bdba
+verbose: True

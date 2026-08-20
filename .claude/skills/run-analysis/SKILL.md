@@ -34,6 +34,14 @@ A standalone script that **clean-builds the target from source**:
 See `../mbedtls-capture/build_capture.bat` and `../stage3/build_capture.bat` for
 working examples (MinGW gcc + Ninja, and MSVC via vcvars respectively).
 
+If the target has several third-party dependencies and you want them all in the
+BOM as **monitored** rather than reference-only, use the **`build-sbom-target`**
+skill instead — it covers building a whole dependency stack from source in one
+`build_cmd`, and catalogues the build-system traps (silent vcpkg fallback,
+static-link defines, CMake 4.x policy removal, decorated MSVC lib names) that
+otherwise cost many capture runs to discover. It ships complete working scripts
+for git (7 components) and Subversion (9).
+
 ## 3. Configure and run the capture
 
 `config.yaml` next to the build script:

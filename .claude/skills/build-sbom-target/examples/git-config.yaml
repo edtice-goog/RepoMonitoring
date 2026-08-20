@@ -1,0 +1,9 @@
+project_name: repo-mon-git
+project_version: 2.51.0
+bd_url: https://sca.field-test.blackduck.com/
+build_dir: C:\Data\repo-monitoring-workspace\git-capture
+build_cmd: C:\Data\repo-monitoring-workspace\git-capture\build_stack.bat
+coverity_root: C:\Coverity\cov-analysis-win64-2026.3.0
+output_dir: C:\Data\repo-monitoring-workspace\bdcpp-output-git
+modes: sig,bdba
+verbose: True
