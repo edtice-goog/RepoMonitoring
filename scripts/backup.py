@@ -40,7 +40,8 @@ PGUSER, PGDB = "repomon", "repomon"
 def wsl(cmd: str) -> str:
     """Run one bash command inside WSL, return stdout (raises on failure)."""
     r = subprocess.run(["wsl", "-e", "bash", "-lc", cmd],
-                       capture_output=True, text=True, timeout=600)
+                       capture_output=True, text=True, timeout=600,
+                       encoding="utf-8", errors="replace")
     if r.returncode != 0:
         raise RuntimeError(f"wsl command failed: {cmd}\n{r.stderr.strip()}")
     return r.stdout.strip()

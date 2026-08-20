@@ -76,7 +76,8 @@ def slugify(name):
 def _git(root, *args):
     try:
         return subprocess.check_output(["git", "-C", root, *args],
-                                       text=True, stderr=subprocess.DEVNULL).strip()
+                                       text=True, encoding="utf-8", errors="replace",
+                                       stderr=subprocess.DEVNULL).strip()
     except Exception:
         return None
 
