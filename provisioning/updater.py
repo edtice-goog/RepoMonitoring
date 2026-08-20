@@ -37,9 +37,18 @@ MAX_BACKFILL = 2000      # hard ceiling for a single "all" backfill
 _RS, _US = "\x1e", "\x1f"   # record / field separators for the log format
 
 
+# git emits UTF-8 (commit messages, author names, paths). `text=True` alone
+# decodes with the LOCALE encoding, which on Windows is cp1252 — a single
+# non-ASCII commit message then kills subprocess's reader thread with
+# UnicodeDecodeError and takes the whole update with it. Always be explicit;
+# errors="replace" keeps a genuinely mis-encoded historical commit from
+# aborting a multi-thousand-commit backfill.
+_TEXT = {"encoding": "utf-8", "errors": "replace"}
+
+
 def _git(cwd, *args, check=True, timeout=600):
     return subprocess.run(["git", "-C", str(cwd), *args], capture_output=True,
-                          text=True, check=check, timeout=timeout)
+                          text=True, check=check, timeout=timeout, **_TEXT)
 
 
 # --------------------------------------------------------------- local clone cache
@@ -53,12 +62,12 @@ def ensure_clone(url):
     fetched = True
     if (dest / "HEAD").exists():
         r = subprocess.run(["git", "-C", str(dest), "remote", "update", "--prune"],
-                           capture_output=True, text=True, timeout=600)
+                           capture_output=True, text=True, timeout=600, **_TEXT)
         fetched = (r.returncode == 0)
     else:
         dest.parent.mkdir(parents=True, exist_ok=True)
         subprocess.run(["git", "clone", "--mirror", "--filter=blob:none", url, str(dest)],
-                       capture_output=True, text=True, check=True, timeout=1800)
+                       capture_output=True, text=True, check=True, timeout=1800, **_TEXT)
     return dest, fetched
 
 
@@ -69,14 +78,14 @@ def _resolve_tag(clone, version):
     u = v.replace(".", "_")
     for cand in (v, f"v{v}", f"OpenSSL_{u}", f"openssl-{v}", f"curl-{u}", f"R_{u}", u):
         r = subprocess.run(["git", "-C", str(clone), "rev-parse", "--verify", "--quiet",
-                            f"refs/tags/{cand}"], capture_output=True, text=True)
+                            f"refs/tags/{cand}"], capture_output=True, text=True, **_TEXT)
         if r.returncode == 0:
             return cand
     # Tagless fork (e.g. busybox-w32 monitored on master): the pinned_ref is the
     # build commit itself, not a release tag. Fall back to resolving it as a
     # commit-ish so the first patch-gap walk still has an exclusive lower bound.
     r = subprocess.run(["git", "-C", str(clone), "rev-parse", "--verify", "--quiet",
-                        f"{v}^{{commit}}"], capture_output=True, text=True)
+                        f"{v}^{{commit}}"], capture_output=True, text=True, **_TEXT)
     if r.returncode == 0:
         return v
     return None

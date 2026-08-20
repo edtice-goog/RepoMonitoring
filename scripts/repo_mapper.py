@@ -119,7 +119,13 @@ def attribute(compiled_paths: List[str],
         for r in sorted(licensed.get(_parent_dir(cp), ())):
             if r in primaries:
                 continue
-            depth, rel = h[r]
+            # `licensed` is a DIRECTORY-level verdict, so it can name a repo that
+            # matched sibling files but not this one; there is no rel path to
+            # attribute in that case. (Guard, not a filter: h[r] used to raise.)
+            hr = h.get(r)
+            if hr is None:
+                continue
+            depth, rel = hr
             attrs.append(Attribution(r, rel, depth, "vendored"))
         out[cp] = attrs
     return out

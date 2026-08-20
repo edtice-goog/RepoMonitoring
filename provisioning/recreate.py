@@ -149,7 +149,8 @@ def recreate_project(name, out_dir, refresh_sbom=False, refresh_events=False,
         if url and norm_repo(url):
             candidates[norm_repo(url)] = {
                 "name": c["componentName"], "slug": slugify(c["componentName"]),
-                "vcs_url": url, "version": c["componentVersionName"], "version_source": "bd"}
+                "vcs_url": url, "version": c["componentVersionName"], "version_source": "bd",
+                "vuln_counts": c.get("vulnCounts")}
 
     # ---------- (3) Claude reconstruction from compiled paths (union) ----------
     source_tails, header_tails = split_tails(all_compiled)
@@ -183,6 +184,45 @@ def recreate_project(name, out_dir, refresh_sbom=False, refresh_events=False,
             candidates[nc] = {"name": repo or nc, "slug": slugify(repo or nc),
                               "vcs_url": p["ground_truth_url"], "version": None,
                               "version_source": "git-discovered", **prov}
+
+    # ---------- (4b) make slugs unique ----------
+    # Slugs come from the BD componentName, but ONE KB component can cover several
+    # upstream repositories, appearing as multiple BoM rows that differ only by
+    # origin. Real case: APR 1.7.6 (apache/apr) and APR-util 1.6.3
+    # (apache/apr-util) are both componentName "Apache Portable Runtime" and share
+    # component UUID 592e09db-328d-4e9d-ab16-805e9151fae8.
+    #
+    # This is BD's modelling, not a glitch to route around — and NOT CPE-driven
+    # (NVD assigns APR-util its own cpe:2.3:a:apache:portable_runtime_utility).
+    # It has teeth: because the two projects then share one version namespace,
+    # CVE-2017-12613 (APR, cpe apache:portable_runtime, "< 1.7.0") is reported
+    # against the apr-util 1.6.3 row, while the real APR here (1.7.6) is clean.
+    #
+    # Splitting per upstream repo is a big part of what this monitor adds over the
+    # BoM alone: BD gives the right discriminator in origins[].externalId even
+    # though componentName collapses it. Mechanically we must split anyway --
+    # candidates is keyed by repo so both survive, but everything downstream keys
+    # on slug (filesets, key_for, slug_by), so a collision silently drops one
+    # component's fileset and then fails attribution. Re-slug every member of a
+    # colliding group from its repo name, which is unique by construction.
+    by_slug = {}
+    for key in sorted(candidates):
+        by_slug.setdefault(candidates[key]["slug"], []).append(key)
+    for slug, keys in sorted(by_slug.items()):
+        if len(keys) < 2:
+            continue
+        log(f"[slug] '{slug}' claimed by {len(keys)} components; re-slugging from repo")
+        taken = {s for s, ks in by_slug.items() if len(ks) == 1}
+        for key in keys:
+            cand = candidates[key]
+            _, repo = parse_owner_repo(cand["vcs_url"])
+            base = slugify(repo or key)
+            new, n = base, 2
+            while new in taken:
+                new, n = f"{base}-{n}", n + 1
+            taken.add(new)
+            log(f"[slug]   {cand['name']} {cand.get('version')} -> {new}")
+            cand["slug"] = new
 
     # ---------- (5) repo trees at the immutable file-scope ref (cached) ----------
     # Prefer the EXACT tag we actually built (git provenance) over BD's component
@@ -281,7 +321,7 @@ def recreate_project(name, out_dir, refresh_sbom=False, refresh_events=False,
     for c in candidates.values():
         it = {"componentName": c["name"], "componentVersionName": c.get("version") or "?",
               "vcsUrl": c["vcs_url"], "versionSource": c["version_source"],
-              "evidence": c.get("evidence"),
+              "evidence": c.get("evidence"), "vulnCounts": c.get("vuln_counts"),
               "monitored_hint": c["slug"] in monitored,
               "watchRef": c.get("watch_ref"), "watchConfidence": c.get("watch_confidence"),
               "releaseStyle": c.get("release_style"), "fileScopeRef": c.get("file_scope_ref"),
@@ -292,6 +332,22 @@ def recreate_project(name, out_dir, refresh_sbom=False, refresh_events=False,
             it["actualSourceRef"] = asrc["ref"]
             it["divergent"] = c.get("divergent", False)
         items.append(it)
+
+    # BD-known vulnerability counts for watches that arrived via another signal
+    # (claude-from-files, git checkout): attach by component name — the BoM
+    # still carries the counts even when it had no VCS URL to seed a candidate.
+    # Exact lowercase match first, else a single unambiguous containment.
+    sbom_counts = {c["componentName"].lower(): c.get("vulnCounts") for c in sbom}
+    for it in items:
+        if it.get("vulnCounts") is not None:
+            continue
+        n = it["componentName"].lower()
+        if n in sbom_counts:
+            it["vulnCounts"] = sbom_counts[n]
+            continue
+        hits = [v for k, v in sbom_counts.items() if k and (k in n or n in k)]
+        if len(hits) == 1:
+            it["vulnCounts"] = hits[0]
     (out_dir / "hub-api-components.json").write_text(json.dumps({
         "_comment": "Union watch manifest (recreated).",
         "project": name, "version": bd_version, "bdProjectUrl": bd_project_url,
