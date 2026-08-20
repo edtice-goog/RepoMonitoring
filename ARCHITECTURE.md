@@ -126,6 +126,17 @@ to triage, which returns one of:
 The dashboard presents this as a **precision funnel** — SBOM (recall) → compiled
 (precision) → monitored vs reference-only — plus the live verdict stream.
 
+**OSV cross-check (ground truth on the triage).** On demand, each event's commit
+is checked against OSV.dev: query the commit's *parent* for the vulnerabilities
+still affecting it, then look for the event commit among the returned records'
+GIT-range `fixed` events — an exact-sha match means "this commit is a published
+CVE fix" straight from the advisory database. No LLM anywhere in the path (local
+git + one HTTPS query, CVSS computed from the vector, verdicts cached in redis),
+so it grades the triage independently: a `response_required` on a known CVE fix
+is corroborated, a `not_meaningful` is a flagged miss, and a `suppressed` CVE fix
+shows the scope filter excluding a patch that touched files outside the compiled
+set (e.g. a MiniZip fix in a build that never compiles `contrib/`).
+
 ---
 
 ## Honesty / design notes

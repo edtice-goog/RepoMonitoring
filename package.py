@@ -19,6 +19,7 @@ INCLUDE = [
     "DEMO.md",
     "DESIGN.md",
     "monitor/app.py",
+    "monitor/osv_enrich.py",
     "triage-service/server.py",
     "driver/replay.py",
     "samples/README.md",

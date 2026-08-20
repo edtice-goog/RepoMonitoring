@@ -12,6 +12,7 @@ notification API; the demo reads the capture + SBOM artifacts from disk.
     GET  /api/watches?project=  watch manifest as JSON
     GET  /api/results?project=  processed commit results as JSON
     POST /webhook              Git webhook; routed to every project watching the repo
+    POST /osv?project=<name>   cross-check events against OSV.dev (no tokens)
 
 Webhook semantics (per project): the commit hash is the unit of selection and
 triage. Changed files are compared against that project's compiled-file index;
@@ -127,7 +128,7 @@ def state_stamp(ps) -> str:
              (ps.results[0].get("commit", "") if ps.results else ""),
              *(str((getattr(ps, a)["at"], getattr(ps, a)["state"])) for a in
                ("recreate_status", "replay_status", "update_status",
-                "fill_status", "audit_status"))]
+                "fill_status", "audit_status", "osv_status"))]
     return hashlib.sha1("|".join(parts).encode()).hexdigest()[:16]
 
 
@@ -179,6 +180,8 @@ class ProjectState:
         self.fill_status = {"state": "idle", "preview": None, "summary": None,
                             "error": None, "at": None}
         self.fill_lock = threading.Lock()
+        self.osv_status = {"state": "idle", "summary": None, "error": None, "at": None}
+        self.osv_lock = threading.Lock()
         self._seen = set()          # commit shas already surfaced (replay/update dedup)
         self._load()
         self.load_rendered()        # populate results from the Postgres render cache (instant)
@@ -397,6 +400,11 @@ class ProjectState:
                 w = self.watch_by_url.get(norm_url(url))
                 if w is not None:
                     w["version_source"] = item.get("versionSource", "bd")
+                    # BD-known vulnerability counts by severity (BDSA + CVE) for
+                    # THIS component version — component-level exposure, distinct
+                    # from the per-commit OSV fix pins. None = BoM not refreshed
+                    # since the field was added; {} = BD knows of none.
+                    w["vuln_counts"] = item.get("vulnCounts")
                     # Keep the KB version label so the UI can show when the locally
                     # discovered ref overrode a conflicting sca:kb identification.
                     if item.get("versionSource") == "bd":
@@ -591,6 +599,15 @@ class ProjectState:
                 "in_scope": matches,
                 "cross_repo": cross_repo,
             }
+            # OSV cross-check, cache-only: replay/webhook rendering never does
+            # network — cached verdicts (seeded by the OSV button) ride along so
+            # a replay doesn't lose the enrichment. Empty verdicts stay off the
+            # row; absence of "osv" just means "not checked or nothing known".
+            import osv_enrich
+            osv = osv_enrich.cached(watch["url"], sha)
+            if osv and osv.get("fixes"):
+                base["osv"] = osv
+
             if not matches:
                 base.update(status="suppressed",
                             reason="no changed file is in the compiled set for this build")
@@ -747,6 +764,74 @@ class ProjectState:
         stats["scope"] = component or "all repos"
         self.fill_status = {"state": "done", "preview": None, "error": None, "at": now_iso(),
                             "summary": stats}
+
+    # ----------------------------------------------------------- OSV cross-check (no tokens)
+    def run_osv(self, component=None, force=False) -> None:
+        """Cross-check monitored events against OSV.dev: is this commit a
+        published fix for a known CVE? Public ground truth, independent of the
+        Claude triage — corroborates response_required verdicts and exposes
+        not_meaningful misses. No tokens; local git (parent sha) + osv.dev API,
+        verdicts cached in redis so a re-run is free. force=True re-queries."""
+        try:
+            import osv_enrich
+            from provisioning.updater import ensure_clone
+            by_comp = {w["component"]: w for w in self.watches
+                       if w.get("monitored")
+                       and (component is None or w["component"] == component)}
+            events = [r for r in self.results
+                      if r.get("component") in by_comp and r.get("commit")]
+            stats = {"checked": 0, "cve_fixes": 0, "cache_hits": 0, "osv_queries": 0,
+                     "corroborated": 0, "mismatches": 0, "out_of_scope_fixes": 0}
+            warnings, changed = [], []
+            by_url = {}
+            for r in events:
+                by_url.setdefault(by_comp[r["component"]]["url"], []).append(r)
+            for url, evs in by_url.items():
+                comp = evs[0]["component"]
+                try:
+                    cdir, fetched = ensure_clone(url)
+                    if not fetched:
+                        warnings.append(f"{comp}: mirror refresh failed; "
+                                        "checking against stale clone")
+                except Exception as exc:
+                    warnings.append(f"{comp}: no local mirror ({exc}); skipped")
+                    continue
+                try:
+                    res, nreq, warns = osv_enrich.check_batch(
+                        url, [r["commit"] for r in evs], cdir, force=force)
+                except Exception as exc:
+                    warnings.append(f"{comp}: {exc}")
+                    continue
+                stats["osv_queries"] += nreq
+                warnings.extend(f"{comp}: {w}" for w in warns)
+                for r in evs:
+                    got = res.get(r["commit"])
+                    if got is None:
+                        continue
+                    entry, src = got
+                    stats["checked"] += 1
+                    if src == "cache":
+                        stats["cache_hits"] += 1
+                    if not (entry.get("fixes") or []):
+                        continue
+                    stats["cve_fixes"] += 1
+                    if r.get("osv") != entry:
+                        r["osv"] = entry
+                        changed.append(r)
+                    verdict = (r.get("triage") or {}).get("verdict")
+                    if verdict == "response_required":
+                        stats["corroborated"] += 1
+                    elif verdict == "not_meaningful":
+                        stats["mismatches"] += 1
+                    elif r.get("status") == "suppressed":
+                        stats["out_of_scope_fixes"] += 1
+            self._persist(changed)          # enriched rows survive a restart
+            stats["scope"] = component or "all repos"
+            self.osv_status = {"state": "done", "error": None, "at": now_iso(),
+                               "summary": {**stats, "warnings": warnings[:8]}}
+        except Exception as exc:
+            self.osv_status = {"state": "error", "summary": None,
+                               "error": repr(exc), "at": now_iso()}
 
     # ----------------------------------------------------------- summary
     def summary(self) -> dict:
@@ -1186,8 +1271,9 @@ def _tokline(s):
 
 
 def render_project(reg: Registry, ps: ProjectState, status_filter: str = None,
-                   comp_filter: str = None) -> bytes:
+                   comp_filter: str = None, cve_filter: str = None) -> bytes:
     comps_on = set(comp_filter.split(",")) if comp_filter else None   # None = all shown
+    cve_mode = cve_filter if cve_filter in ("only", "none") else None  # None = both
     locked = ps.is_locked()   # replay/recreate reconciling -> action buttons grey out
 
     def _greybtn(label, pad="6px 12px", fsize=13):
@@ -1270,11 +1356,33 @@ def render_project(reg: Registry, ps: ProjectState, status_filter: str = None,
                 f"value=\"{esc(w['component'])}\" onchange='applyCompFilter()'"
                 f"{' checked' if on else ''}></td>")
 
+    def _vulns_cell(w):
+        # Component-level exposure from BD SCA (BDSA + CVE, by severity) — the
+        # honest denominator next to the per-commit OSV fix pins. None means the
+        # cached BoM snapshot predates the field; a Recreate refreshes it.
+        vc = w.get("vuln_counts")
+        if vc is None:
+            return ("<td class='muted' title='no BD SCA count available — the component "
+                    "did not match the BoM by name, or the BoM has not been refreshed "
+                    "(Recreate) since this field was added'>&mdash;</td>")
+        total = sum(vc.values())
+        if not total:
+            return "<td class='muted'>0</td>"
+        sev = " ".join(
+            f"<span style='color:{c};font-weight:600'>{vc[k]} {lbl}</span>"
+            for k, c, lbl in (("CRITICAL", "#C0392B", "crit"), ("HIGH", "#E67E22", "high"),
+                              ("MEDIUM", "#B9770E", "med"), ("LOW", "#7F8C8D", "low"))
+            if vc.get(k))
+        t = (f"<a href='{esc(ps.bd_project_url)}' target='_blank' "
+             f"style='color:inherit'><b>{total}</b></a>" if ps.bd_project_url
+             else f"<b>{total}</b>")
+        return f"<td>{t} <span style='font-size:12px'>({sev})</span></td>"
+
     def _rows(ws, actions=False, checks=False):
         return "".join(
             "<tr>"
             + (_check_cell(w) if checks else "")
-            + f"<td>{esc(w['component'])}</td><td>{_url(w)}</td>"
+            + f"<td>{esc(w['component'])}</td>{_vulns_cell(w)}<td>{_url(w)}</td>"
             f"<td>{esc(w['relationship'])}</td><td>{_prov(w)}</td>"
             f"<td>{_pin(w)}</td><td>{_watch(w)}</td>"
             + (f"<td>{_repo_actions(w)}</td>" if actions else "")
@@ -1295,7 +1403,9 @@ def render_project(reg: Registry, ps: ProjectState, status_filter: str = None,
             f"<p class='muted'>In the SBOM but not compiled from source in this build "
             f"(linked/prebuilt) — listed for transparency, excluded from monitoring.</p>"
             f"<table><tr><th title='filter events by dependency'>&#9745;</th>"
-            f"<th>Component</th><th>VCS URL</th><th>Relationship</th>"
+            f"<th>Component</th><th title='BD SCA known vulnerabilities (BDSA + CVE) "
+            f"for this component version'>Known vulns (BD SCA)</th>"
+            f"<th>VCS URL</th><th>Relationship</th>"
             f"<th>Provenance</th><th>Pinned ref</th><th>Watches (branch)</th></tr>"
             f"{_rows(ref, checks=True)}</table>")
 
@@ -1335,13 +1445,47 @@ def render_project(reg: Registry, ps: ProjectState, status_filter: str = None,
                 f"<div class='muted' style='color:#B9770E;margin-top:6px'>"
                 f"⇄ same file is also in {items} — propagate the fix; the mirrored "
                 f"copy is likely behind</div>")
+        # OSV cross-check: public ground truth riding next to the triage. The
+        # pill links the advisory; the note states agreement or the miss.
+        osv_html = ""
+        fixes = (r.get("osv") or {}).get("fixes") or []
+        if fixes:
+            pills = " ".join(
+                f"<a href='https://osv.dev/vulnerability/{quote(f['id'])}' target='_blank' "
+                f"title='{attr(f.get('summary') or '')}' style='background:#7B241C;color:#fff;"
+                f"text-decoration:none;padding:2px 9px;border-radius:11px;font-size:12px;"
+                f"display:inline-block'>&#x26E8; fixes {esc(f['cve'])}"
+                + (f" &middot; CVSS {f['cvss']}" if f.get("cvss") is not None else "")
+                + "</a>" for f in fixes)
+            ids = ", ".join(f["cve"] for f in fixes)
+            verdict = (r.get("triage") or {}).get("verdict")
+            if verdict == "response_required":
+                note = ("#2E7D32", "&#10003; OSV corroborates the triage — this commit "
+                                   f"is the published fix for {esc(ids)}")
+            elif verdict == "not_meaningful":
+                note = ("#C0392B", "<b>&#9888; triage mismatch:</b> OSV lists this commit "
+                                   f"as the published fix for {esc(ids)}, but triage said "
+                                   "not_meaningful — re-review")
+            elif label == "untriaged":
+                note = ("#B9770E", f"published CVE fix per OSV ({esc(ids)}) — prioritize triage")
+            elif verdict == "needs_human_review":
+                note = ("#B9770E", f"published CVE fix per OSV ({esc(ids)}) — prioritize this review")
+            elif label == "suppressed":
+                note = ("#34495E", f"fixes {esc(ids)} in files outside this build's compiled "
+                                   "set — the scope filter suppressed it; worth verifying "
+                                   "those files really aren't shipped")
+            else:
+                note = ("#34495E", f"published fix for {esc(ids)} per OSV")
+            osv_html = (f"<div style='margin-top:6px'>{pills} "
+                        f"<span style='font-size:12px;color:{note[0]}'>{note[1]}</span></div>")
+
         return (
             f"<div class='card' style='border-left:6px solid {color}'>"
             f"<div><span class='badge' style='background:{color}'>{esc(label)}</span> "
             f"<b>{esc(r.get('component', r.get('repo', '?')))}</b> "
             f"<code>{esc(str(r.get('commit', r.get('commits', '?'))))[:16]}</code> "
             f"<span class='muted'>{esc(r.get('ref', ''))} · {_when(r)}</span></div>"
-            f"{scope_html}"
+            f"{osv_html}{scope_html}"
             f"<div class='rationale'>{rationale}</div>{cross_html}{changed_html}</div>")
 
     # Status filter (URL param, so it survives the 3 s auto-refresh). A handful of
@@ -1350,7 +1494,9 @@ def render_project(reg: Registry, ps: ProjectState, status_filter: str = None,
     counts = Counter(_event_label(r) for r in ps.results)
     filtered = [r for r in ps.results
                 if (active is None or _event_label(r) in active)
-                and (comps_on is None or r.get("component") in comps_on)]
+                and (comps_on is None or r.get("component") in comps_on)
+                and (cve_mode is None
+                     or bool(r.get("osv")) == (cve_mode == "only"))]
     untri_by_comp = Counter(r.get("component") for r in ps.results
                             if _event_label(r) == "untriaged")
 
@@ -1373,13 +1519,14 @@ def render_project(reg: Registry, ps: ProjectState, status_filter: str = None,
         return upd + fil
 
     comp_q = f"&comp={quote(','.join(sorted(comps_on)))}" if comps_on else ""
+    cve_q = f"&cve={cve_mode}" if cve_mode else ""
 
     def _toggle_href(label):
         cur = set(active) if active else set()
         new = {label} if active is None else (cur - {label} if label in cur else cur | {label})
         if not new:
-            return f"/?project={quote(ps.name)}{comp_q}"
-        return f"/?project={quote(ps.name)}&status={quote(','.join(sorted(new)))}{comp_q}"
+            return f"/?project={quote(ps.name)}{comp_q}{cve_q}"
+        return f"/?project={quote(ps.name)}&status={quote(','.join(sorted(new)))}{comp_q}{cve_q}"
 
     def _chip(label, count, href, on):
         c = _label_color(label)
@@ -1394,11 +1541,57 @@ def render_project(reg: Registry, ps: ProjectState, status_filter: str = None,
                  + [l for l in counts if l not in _LABEL_COLOR])
         chip_html = "".join(_chip(l, counts[l], _toggle_href(l), active is None or l in active)
                             for l in order)
-        all_href = f"/?project={quote(ps.name)}{comp_q}"
-        act_href = f"/?project={quote(ps.name)}&status={quote(','.join(_ACTIONABLE))}{comp_q}"
+        all_href = f"/?project={quote(ps.name)}{comp_q}{cve_q}"
+        act_href = f"/?project={quote(ps.name)}&status={quote(','.join(_ACTIONABLE))}{comp_q}{cve_q}"
+
+        # OSV facet: with CVE / without CVE / both (both = no chip active).
+        # Clicking the active chip clears it. Orthogonal to the status chips —
+        # the hrefs carry status/comp; the comp-filter JS keeps `cve` in turn.
+        n_cve = sum(1 for r in ps.results if r.get("osv"))
+        status_q = f"&status={quote(','.join(sorted(active)))}" if active else ""
+
+        chip_title = ("commits OSV pins to a published fix in this feed window — NOT the "
+                      "component&#39;s total known vulnerabilities; see the Known vulns "
+                      "(BD SCA) column for component-level exposure")
+
+        def _cvechip(label, mode, color, count):
+            on = cve_mode == mode
+            href = (f"/?project={quote(ps.name)}{status_q}{comp_q}"
+                    + ("" if on else f"&cve={mode}"))
+            style = (f"background:{color};color:#fff" if on
+                     else f"background:#eee;color:{color};opacity:.6")
+            return (f"<a href='{href}' title='{chip_title}' style='text-decoration:none;"
+                    f"{style};padding:2px 9px;border-radius:11px;font-size:12px;"
+                    f"margin:0 5px 5px 0;display:inline-block'>{label} {count}</a>")
+
+        cve_bar = ("<span style='margin-left:12px;font-size:12px' class='muted'>OSV:</span> "
+                   + _cvechip("&#x26E8; fixes a CVE", "only", "#7B241C", n_cve)
+                   + _cvechip("no CVE pinned", "none", "#566573", len(ps.results) - n_cve))
+
+        # The denominator, stated in place: an OSV pin count of 1 next to a
+        # component with dozens of BD-known vulnerabilities must not read as
+        # "this component has 1 CVE".
+        bd_total = sum(sum((w.get("vuln_counts") or {}).values()) for w in ps.watches)
+        have_counts = any(w.get("vuln_counts") is not None for w in ps.watches)
+        if have_counts:
+            expo = (f"&#x26E8; counts above = commits OSV pins to a published fix in this "
+                    f"feed — not total exposure. BD SCA knows <b>{bd_total}</b> "
+                    f"vulnerabilit{'y' if bd_total == 1 else 'ies'} (BDSA + CVE) across "
+                    f"this build&#39;s components; per-component breakdown in the tables above.")
+        elif ps.bd_project_url:
+            expo = ("&#x26E8; counts above = commits OSV pins to a published fix in this "
+                    "feed — not total exposure. No component-level counts from the BD SCA "
+                    "BoM yet — either the snapshot predates this field (press Refresh SCA "
+                    "data) or the BoM lists no matching components.")
+        else:
+            expo = ("&#x26E8; counts above = commits OSV pins to a published fix in this "
+                    "feed — not total exposure. This project has no BD SCA BoM "
+                    "association, so component-level exposure is not tracked here.")
+        cve_bar += (f"<div class='muted' style='font-size:12px;margin-top:2px'>{expo}</div>")
         filter_bar = (f"<div style='margin:8px 0'>{chip_html}"
                       f"<a href='{all_href}' style='font-size:12px;margin-left:6px'>all</a> &middot; "
-                      f"<a href='{act_href}' style='font-size:12px'>actionable</a></div>")
+                      f"<a href='{act_href}' style='font-size:12px'>actionable</a>"
+                      f"{cve_bar}</div>")
 
     CARD_CAP = 300
     if not ps.results:
@@ -1410,12 +1603,16 @@ def render_project(reg: Registry, ps: ProjectState, status_filter: str = None,
                 f"the filter chips above.</p>" if len(filtered) > CARD_CAP else "")
         cards = note + "".join(result_card(r) for r in filtered[:CARD_CAP])
 
+    # Recreate grew up: born a cache-integrity debugging tool, it is now the
+    # refresh path for the BD SCA side (BoM components + known-vuln counts) —
+    # label and describe it by that purpose.
     rs = ps.recreate_status
     if rs["state"] == "running":
-        st = "<span style='color:#B9770E'>recreating… refreshing BoM + cache-backed rebuild</span>"
+        st = ("<span style='color:#B9770E'>refreshing BD SCA BoM (components + "
+              "known-vuln counts) + cache-backed rebuild…</span>")
     elif rs["state"] == "done":
         s = rs["summary"] or {}
-        st = (f"<span style='color:#2E7D32'>last recreate {esc(rs['at'])}: "
+        st = (f"<span style='color:#2E7D32'>last SCA refresh {esc(rs['at'])}: "
               f"{s.get('external_calls', '?')} external call(s), monitored="
               f"{esc(s.get('monitored'))}</span>")
         if s.get("replay"):
@@ -1423,13 +1620,16 @@ def render_project(reg: Registry, ps: ProjectState, status_filter: str = None,
         if (s.get("warnings") or []):
             st += f" <span style='color:#B9770E'>· {esc('; '.join(s['warnings']))}</span>"
     elif rs["state"] == "error":
-        st = f"<span style='color:#C0392B'>recreate error: {esc(rs['error'])}</span>"
+        st = f"<span style='color:#C0392B'>SCA refresh error: {esc(rs['error'])}</span>"
     else:
-        st = "<span class='muted'>idle</span>"
-    recreate_btn = _greybtn("&#x1F504; Recreate") if locked else (
+        st = ("<span class='muted'>re-pull the Black Duck SCA BoM — components and "
+              "known-vuln counts — and rebuild the project from cache (recreate)</span>")
+    recreate_btn = _greybtn("&#x1F504; Refresh SCA data") if locked else (
         f"<button onclick=\"this.disabled=true;doRecreate('{quote(ps.name)}')\" "
+        f"title='re-pulls the BD SCA BoM and rebuilds this project&#39;s artifacts from "
+        f"Postgres seeds + redis cache (recreate)' "
         f"style='background:#582C83;color:#fff;border:0;border-radius:4px;padding:6px 12px;"
-        f"cursor:pointer;font-size:13px'>&#x1F504; Recreate</button>")
+        f"cursor:pointer;font-size:13px'>&#x1F504; Refresh SCA data</button>")
     delete_btn = (
         f"<button onclick=\"if(confirm('Delete project {esc(ps.name)}? Removes it from the "
         f"monitor, deletes its database rows and local data dir. The Black Duck SCA project "
@@ -1555,6 +1755,39 @@ def render_project(reg: Registry, ps: ProjectState, status_filter: str = None,
         fst = "<span class='muted'>run Claude triage on the yellow (untriaged) commits</span>"
     fill_html = f"{fill_btn} <span style='font-size:12px'>{fst}</span>"
 
+    # OSV cross-check: public ground truth vs the triage (no tokens, redis-cached).
+    ov = ps.osv_status
+    osv_btn = _greybtn("&#x26E8; OSV cross-check") if locked else (
+        f"<button onclick=\"this.disabled=true;fetch('/osv?project={quote(ps.name)}',"
+        f"{{method:'POST'}}).then(()=>setTimeout(()=>location.reload(),500))\" "
+        f"style='background:#2E86C1;color:#fff;border:0;border-radius:4px;padding:6px 12px;"
+        f"cursor:pointer;font-size:13px'>&#x26E8; OSV cross-check</button>")
+    if ov["state"] == "running":
+        ovt = "<span style='color:#B9770E'>checking commits against OSV.dev&hellip;</span>"
+    elif ov["state"] == "done":
+        s = ov["summary"] or {}
+        bits = (f"checked {s.get('checked', 0)} &middot; {s.get('cve_fixes', 0)} known "
+                f"CVE fix(es) &middot; {s.get('corroborated', 0)} corroborated")
+        if s.get("mismatches"):
+            bits += f" &middot; <b style='color:#C0392B'>{s['mismatches']} triage mismatch(es)</b>"
+        if s.get("out_of_scope_fixes"):
+            bits += f" &middot; {s['out_of_scope_fixes']} out-of-scope"
+        if s.get("osv_queries"):
+            bits += (f" <span class='muted'>({s['osv_queries']} osv.dev quer"
+                     f"{'y' if s['osv_queries'] == 1 else 'ies'}, "
+                     f"{s.get('cache_hits', 0)} cached)</span>")
+        else:
+            bits += f" <span class='muted'>(all {s.get('cache_hits', 0)} from cache)</span>"
+        ovt = f"<span style='color:#2E7D32'>[{esc(s.get('scope', 'all repos'))}] {bits}</span>"
+        if s.get("warnings"):
+            ovt += f" <span style='color:#B9770E'>&middot; {esc('; '.join(s['warnings']))}</span>"
+    elif ov["state"] == "error":
+        ovt = f"<span style='color:#C0392B'>OSV check error: {esc(ov['error'])}</span>"
+    else:
+        ovt = ("<span class='muted'>cross-check commits against OSV.dev advisories — "
+               "public ground truth on the triage (no tokens)</span>")
+    osv_html = f"{osv_btn} <span style='font-size:12px'>{ovt}</span>"
+
     body = f"""
 <p><a href="/">&larr; Projects</a></p>
 <h1>{esc(ps.name)} <span class="muted">({esc(ps.build_id)})</span></h1>
@@ -1565,12 +1798,13 @@ def render_project(reg: Registry, ps: ProjectState, status_filter: str = None,
 <p>{update_html}</p>
 <p>{audit_html}</p>
 <p>{fill_html}</p>
+<p>{osv_html}</p>
 <p class="muted" style="font-size:13px"><b>Precision funnel:</b> {funnel}</p>
 <h2>Monitored repos ({len(mon)})</h2>
-<table><tr><th title="select all — filter the event feed by dependency"><input type="checkbox" onchange="toggleAllComp(this)"{' checked' if comps_on is None else ''}></th><th>Component</th><th>VCS URL</th><th>Relationship</th><th>Provenance</th><th>Pinned ref</th><th>Watches (branch)</th><th>Actions</th></tr>
+<table><tr><th title="select all — filter the event feed by dependency"><input type="checkbox" onchange="toggleAllComp(this)"{' checked' if comps_on is None else ''}></th><th>Component</th><th title="BD SCA known vulnerabilities (BDSA + CVE) for this component version">Known vulns (BD SCA)</th><th>VCS URL</th><th>Relationship</th><th>Provenance</th><th>Pinned ref</th><th>Watches (branch)</th><th>Actions</th></tr>
 {_rows(mon, actions=True, checks=True)}</table>
 {ref_section}
-<h2>Commit events ({len(filtered)}{f' of {len(ps.results)}' if (active or comps_on) else ''})</h2>
+<h2>Commit events ({len(filtered)}{f' of {len(ps.results)}' if (active or comps_on or cve_mode) else ''})</h2>
 {filter_bar}
 {cards}
 <script>
@@ -1637,7 +1871,8 @@ class MonitorHandler(BaseHTTPRequestHandler):
                 else:
                     status = unquote(qs["status"][0]) if "status" in qs else None
                     comp = unquote(qs["comp"][0]) if "comp" in qs else None
-                    self._send(200, render_project(self.reg, ps, status, comp),
+                    cve = unquote(qs["cve"][0]) if "cve" in qs else None
+                    self._send(200, render_project(self.reg, ps, status, comp, cve),
                                "text/html; charset=utf-8")
             else:
                 self._send(200, render_project_list(self.reg), "text/html; charset=utf-8")
@@ -1837,6 +2072,34 @@ class MonitorHandler(BaseHTTPRequestHandler):
                 ps.update_status = {"state": "running", "summary": None, "error": None,
                                     "at": now_iso()}
             threading.Thread(target=ps.run_update, kwargs={"component": component},
+                             daemon=True).start()
+            self._send_json(202, {"status": "started"})
+            return
+
+        # UI action: cross-check events against OSV.dev (no tokens; local git +
+        # osv.dev API, redis-cached). Optional &component scopes to one repo;
+        # &force=1 bypasses the cache (OSV gains records over time).
+        if parsed.path == "/osv":
+            qs = parse_qs(parsed.query)
+            project = unquote(qs["project"][0]) if "project" in qs else None
+            component = unquote(qs["component"][0]) if "component" in qs else None
+            force = qs.get("force", ["0"])[0] in ("1", "true")
+            ps = self.reg.projects.get(project)
+            if ps is None:
+                self._send_json(404, {"error": f"unknown project {project}"})
+                return
+            if ps.is_locked():
+                self._send_json(409, {"status": "busy",
+                                      "reason": "replay/recreate in progress; try again shortly"})
+                return
+            with ps.osv_lock:
+                if ps.osv_status["state"] == "running":
+                    self._send_json(409, {"status": "busy"})
+                    return
+                ps.osv_status = {"state": "running", "summary": None, "error": None,
+                                 "at": now_iso()}
+            threading.Thread(target=ps.run_osv,
+                             kwargs={"component": component, "force": force},
                              daemon=True).start()
             self._send_json(202, {"status": "started"})
             return

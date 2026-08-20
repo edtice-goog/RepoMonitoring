@@ -106,18 +106,24 @@ def bd_ui_url(base_url: str, proj: dict, ver: dict) -> str:
 
 
 def component_context(comps: list) -> list:
-    """Distill each BOM component to the fields Claude needs to resolve a repo."""
+    """Distill each BOM component to the fields Claude needs to resolve a repo,
+    plus the BD-known vulnerability counts (securityRiskProfile — BDSA and CVE
+    merged, by severity) the monitor shows as component-level exposure."""
     out = []
     for c in comps:
         origins = [
             {"namespace": o.get("externalNamespace"), "externalId": o.get("externalId")}
             for o in c.get("origins", [])
         ]
+        counts = {e.get("countType"): e.get("count", 0)
+                  for e in (c.get("securityRiskProfile") or {}).get("counts", [])
+                  if e.get("countType") != "OK" and e.get("count")}
         out.append({
             "componentName": c.get("componentName", "?"),
             "componentVersionName": c.get("componentVersionName", "?"),
             "origins": origins,
             "licenses": [l.get("licenseDisplay") for l in c.get("licenses", [])],
+            "vulnCounts": counts,
         })
     return out
 
